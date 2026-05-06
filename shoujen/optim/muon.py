@@ -11,9 +11,10 @@ DDP gradient gather. Good enough for a toy single-machine MPS run.
     1. Preserve RWKV-v7 optimizer intent first: `w0` gets a 2x AdamW lr,
        time-mix LoRA/scalar params, norm and bias params use AdamW without
        weight decay.
-    2. Move only dense-input linear layer matrices to Muon. Embeddings, PLE,
-       LM head, norm, bias, per-layer gates and RWKV small/LoRA params stay on
-       AdamW.
+    2. Move only dense-input linear layer matrices to Muon. Embeddings,
+       LM head, norm, bias, and RWKV small/LoRA params stay on AdamW.
+       Embeddings use an independent AdamW decay group by default, so their
+       decay can be tuned without moving the hidden-matrix LR.
 """
 
 from __future__ import annotations
@@ -59,6 +60,9 @@ class Muon(Optimizer):
         nesterov: bool = True,
         ns_steps: int = 5,
         weight_decay: float = 0.0,
+        adaptive: bool = False,
+        adaptive_beta2: float = 0.95,
+        adaptive_eps: float = 1e-8,
     ):
         defaults = dict(
             lr=lr,
@@ -66,8 +70,18 @@ class Muon(Optimizer):
             nesterov=nesterov,
             ns_steps=ns_steps,
             weight_decay=weight_decay,
+            adaptive=adaptive,
+            adaptive_beta2=adaptive_beta2,
+            adaptive_eps=adaptive_eps,
         )
         super().__init__(params, defaults)
+
+    def load_state_dict(self, state_dict):  # type: ignore[override]
+        super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            group.setdefault("adaptive", self.defaults["adaptive"])
+            group.setdefault("adaptive_beta2", self.defaults["adaptive_beta2"])
+            group.setdefault("adaptive_eps", self.defaults["adaptive_eps"])
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -82,6 +96,9 @@ class Muon(Optimizer):
             nesterov = group["nesterov"]
             ns_steps = group["ns_steps"]
             wd = group["weight_decay"]
+            adaptive = group["adaptive"]
+            adaptive_beta2 = group["adaptive_beta2"]
+            adaptive_eps = group["adaptive_eps"]
 
             for p in group["params"]:
                 if p.grad is None:
@@ -100,8 +117,23 @@ class Muon(Optimizer):
                 buf.mul_(mu).add_(g)
                 use = g.add(buf, alpha=mu) if nesterov else buf
                 update = newton_schulz(use, steps=ns_steps)
-                scale = 0.2 * max(update.shape[0], update.shape[1]) ** 0.5
-                p.add_(update, alpha=-lr * scale)
+                if adaptive:
+                    if "variance" not in state:
+                        state["variance"] = torch.zeros_like(p, dtype=torch.float32)
+                    update_f = update.float()
+                    variance = state["variance"]
+                    variance.mul_(adaptive_beta2).addcmul_(
+                        update_f,
+                        update_f,
+                        value=1.0 - adaptive_beta2,
+                    )
+                    update_f = update_f / variance.sqrt().add(adaptive_eps)
+                    target_norm = 0.2 * update.numel() ** 0.5
+                    update_f.mul_(target_norm / update_f.norm().clamp(min=adaptive_eps))
+                    p.add_(update_f.to(dtype=p.dtype), alpha=-lr)
+                else:
+                    scale = 0.2 * max(update.shape[0], update.shape[1]) ** 0.5
+                    p.add_(update, alpha=-lr * scale)
 
         return loss
 
@@ -135,6 +167,10 @@ def _is_rwkv_w0(name: str) -> bool:
     return ".token_mixer.w0" in name or ".tmix.w0" in name
 
 
+def _is_embedding_param(name: str) -> bool:
+    return name in {"model.embed_tokens.weight", "lm_head.weight"}
+
+
 def _is_adamw_no_decay(name: str, param: nn.Parameter) -> bool:
     if _is_rwkv_w0(name):
         return True
@@ -155,17 +191,23 @@ def build_optimizers(
     muon_momentum: float = 0.95,
     muon_ns_steps: int = 5,
     muon_wd: float = 0.0,
+    muon_adaptive: bool = True,
+    muon_adaptive_beta2: float = 0.95,
+    muon_adaptive_eps: float = 1e-8,
     adamw_lr: float = 3e-4,
     adamw_betas: tuple[float, float] = (0.9, 0.95),
     adamw_eps: float = 1e-8,
     adamw_wd: float = 0.1,
+    adamw_embed_wd: float | None = 0.0,
     adamw_foreach: bool | None = None,
 ) -> tuple[Muon, torch.optim.AdamW]:
     muon_params: list[nn.Parameter] = []
     adamw_decay: list[nn.Parameter] = []
+    adamw_embed_decay: list[nn.Parameter] = []
     adamw_no_decay: list[nn.Parameter] = []
     adamw_rwkv_w0: list[nn.Parameter] = []
     seen: set[int] = set()
+    split_embed_wd = adamw_embed_wd is not None
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -181,6 +223,8 @@ def build_optimizers(
         else:
             if _is_adamw_no_decay(name, p):
                 adamw_no_decay.append(p)
+            elif split_embed_wd and _is_embedding_param(name):
+                adamw_embed_decay.append(p)
             else:
                 adamw_decay.append(p)
 
@@ -190,16 +234,26 @@ def build_optimizers(
         momentum=muon_momentum,
         ns_steps=muon_ns_steps,
         weight_decay=muon_wd,
+        adaptive=muon_adaptive,
+        adaptive_beta2=muon_adaptive_beta2,
+        adaptive_eps=muon_adaptive_eps,
     )
     adamw_kwargs = {}
     if adamw_foreach is not None:
         adamw_kwargs["foreach"] = adamw_foreach
-    adamw = torch.optim.AdamW(
+    param_groups = [
+        {"params": adamw_decay, "weight_decay": adamw_wd},
+    ]
+    if split_embed_wd:
+        param_groups.append({"params": adamw_embed_decay, "weight_decay": adamw_embed_wd})
+    param_groups.extend(
         [
-            {"params": adamw_decay, "weight_decay": adamw_wd},
             {"params": adamw_rwkv_w0, "weight_decay": 0.0, "lr": adamw_lr * 2.0, "my_lr_scale": 2.0},
             {"params": adamw_no_decay, "weight_decay": 0.0},
-        ],
+        ]
+    )
+    adamw = torch.optim.AdamW(
+        param_groups,
         lr=adamw_lr,
         betas=adamw_betas,
         eps=adamw_eps,

@@ -27,10 +27,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from shoujen.config import ShoujenConfig
-from shoujen.losses import compute_lm_loss
+from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
-from shoujen.train_utils import autocast_dtype, pick_device, set_optimizer_lr, warmup_cosine_lr
+from shoujen.train_utils import (
+    autocast_dtype,
+    pick_device,
+    set_optimizer_lr,
+    warmup_cosine_lr,
+    warmup_stable_decay_lr,
+)
 
 
 DATA_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
@@ -44,24 +50,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--block-size", type=int, default=128)
-    p.add_argument("--max-steps", type=int, default=20)
+    p.add_argument("--block-size", type=int, default=2048)
+    p.add_argument("--max-steps", type=int, default=50)
+    p.add_argument("--models", nargs="+", choices=["shoujen", "gpt2-small"], default=["shoujen", "gpt2-small"])
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--eval-batches", type=int, default=4)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--force-attention-mask", action="store_true")
     p.add_argument("--warmup", type=int, default=0)
+    p.add_argument("--lr-schedule", choices=["cosine", "wsd"], default="cosine")
     p.add_argument("--lr-min-ratio", type=float, default=1.0)
+    p.add_argument("--lr-stable-steps", type=int, default=0)
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--amp-dtype", choices=["auto", "fp16", "bf16", "none"], default="auto")
     p.add_argument("--optimizer-mode", choices=["project", "same-adamw"], default="project")
-    p.add_argument("--adamw-lr", type=float, default=3e-4)
+    p.add_argument("--adamw-lr", type=float, default=1e-4)
     p.add_argument("--gpt2-lr", type=float, default=6e-4)
     p.add_argument("--adamw-wd", type=float, default=0.1)
+    p.add_argument("--adamw-independent-wd", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--adamw-embed-wd", type=float, default=0.0)
     p.add_argument("--adamw-foreach", action="store_true")
     p.add_argument("--muon-lr", type=float, default=3e-4)
     p.add_argument("--muon-ns-steps", type=int, default=5)
     p.add_argument("--muon-wd", type=float, default=0.0)
+    p.add_argument("--muon-adaptive", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--muon-adaptive-beta2", type=float, default=0.95)
+    p.add_argument("--muon-adaptive-eps", type=float, default=1e-8)
+    p.add_argument("--qk-norm", action="store_true")
+    p.add_argument("--z-loss-weight", type=float, default=1e-4)
+    p.add_argument("--log-max-qk-logit", action="store_true")
     return p.parse_args()
 
 
@@ -111,7 +128,7 @@ def make_batch(
     return x_cpu.to(device), y_cpu.to(device)
 
 
-def build_shoujen(vocab_size: int, block_size: int) -> ShoujenLM:
+def build_shoujen(vocab_size: int, block_size: int, *, qk_norm: bool = False) -> ShoujenLM:
     config = ShoujenConfig(
         vocab_size=vocab_size,
         max_seq_len=block_size,
@@ -119,6 +136,7 @@ def build_shoujen(vocab_size: int, block_size: int) -> ShoujenLM:
         pad_token_id=0,
         eos_token_id=1,
         use_cache=False,
+        qk_norm=qk_norm,
     )
     return ShoujenLM(config)
 
@@ -187,8 +205,12 @@ def build_optimizer_set(
             muon_lr=args.muon_lr,
             muon_ns_steps=args.muon_ns_steps,
             muon_wd=args.muon_wd,
+            muon_adaptive=args.muon_adaptive,
+            muon_adaptive_beta2=args.muon_adaptive_beta2,
+            muon_adaptive_eps=args.muon_adaptive_eps,
             adamw_lr=args.adamw_lr,
             adamw_wd=args.adamw_wd,
+            adamw_embed_wd=args.adamw_embed_wd if args.adamw_independent_wd else None,
             adamw_foreach=True if args.adamw_foreach else None,
         )
         return [muon, adamw]
@@ -207,6 +229,22 @@ def autocast_context(device: torch.device, amp_dtype: torch.dtype | None):
     if amp_dtype is None:
         return contextlib.nullcontext()
     return torch.autocast(device_type=device.type, dtype=amp_dtype)
+
+
+def lr_multiplier(args: argparse.Namespace, step: int) -> float:
+    if args.lr_schedule == "wsd":
+        return warmup_stable_decay_lr(
+            step,
+            warmup=args.warmup,
+            max_steps=args.max_steps,
+            stable_steps=args.lr_stable_steps,
+        )
+    return warmup_cosine_lr(
+        step,
+        warmup=args.warmup,
+        max_steps=args.max_steps,
+        min_ratio=args.lr_min_ratio,
+    )
 
 
 @torch.no_grad()
@@ -247,6 +285,8 @@ def train_one(
     torch.manual_seed(args.seed)
     model.to(device)
     model.train()
+    if hasattr(model, "set_track_max_qk_logit"):
+        model.set_track_max_qk_logit(args.log_max_qk_logit)
     optimizers = build_optimizer_set(name, model, args)
     base_lrs = [[group["lr"] for group in opt.param_groups] for opt in optimizers]
 
@@ -270,13 +310,8 @@ def train_one(
     for step, batch_starts in enumerate(train_starts, start=1):
         x, y = make_batch(train_data, batch_starts, args.block_size, device)
         attention_mask = torch.ones_like(x) if args.force_attention_mask else None
-        if args.warmup > 0 or args.lr_min_ratio < 1.0:
-            lr_mult = warmup_cosine_lr(
-                step - 1,
-                warmup=args.warmup,
-                max_steps=args.max_steps,
-                min_ratio=args.lr_min_ratio,
-            )
+        if args.warmup > 0 or args.lr_min_ratio < 1.0 or args.lr_schedule == "wsd":
+            lr_mult = lr_multiplier(args, step - 1)
             for opt, lrs in zip(optimizers, base_lrs):
                 set_optimizer_lr(opt, lrs, lr_mult)
 
@@ -285,7 +320,12 @@ def train_one(
         with autocast_context(device, amp_dtype):
             logits = model(x, attention_mask=attention_mask, use_cache=False).logits
             loss, _ = compute_lm_loss(logits.float(), y)
-        loss.backward()
+            z_loss = None
+            total_loss = loss
+            if name == "shoujen" and args.z_loss_weight:
+                z_loss = compute_z_loss(logits.float(), y)
+                total_loss = total_loss + args.z_loss_weight * z_loss
+        total_loss.backward()
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         for opt in optimizers:
@@ -310,11 +350,20 @@ def train_one(
                     "train_loss": float(loss.item()),
                     "val_loss": val_loss,
                     "tok_per_sec": tok_per_sec,
+                    "z_loss": None if z_loss is None else float(z_loss.item()),
+                    "max_qk_logit": model.max_qk_logit() if hasattr(model, "max_qk_logit") else None,
                 }
             )
+            extras = ""
+            if z_loss is not None:
+                extras += f" z={z_loss.item():.4f} total={total_loss.item():.4f}"
+            if args.log_max_qk_logit and hasattr(model, "max_qk_logit"):
+                max_qk = model.max_qk_logit()
+                if max_qk is not None:
+                    extras += f" max_qk={max_qk:.2f}"
             print(
                 f"{name}: step={step:04d} train={loss.item():.4f} "
-                f"val={val_loss:.4f} tok/s={tok_per_sec:.0f}",
+                f"val={val_loss:.4f}{extras} tok/s={tok_per_sec:.0f}",
                 flush=True,
             )
             last_time = now
@@ -392,39 +441,41 @@ def main() -> None:
     )
 
     results = []
-    torch.manual_seed(args.seed)
-    shoujen = build_shoujen(vocab_size, args.block_size)
-    results.append(
-        train_one(
-            name="shoujen",
-            model=shoujen,
-            train_data=train_data,
-            val_data=val_data,
-            train_starts=train_starts,
-            eval_starts=eval_starts,
-            args=args,
-            device=device,
-            amp_dtype=amp_dtype,
+    if "shoujen" in args.models:
+        torch.manual_seed(args.seed)
+        shoujen = build_shoujen(vocab_size, args.block_size, qk_norm=args.qk_norm)
+        results.append(
+            train_one(
+                name="shoujen",
+                model=shoujen,
+                train_data=train_data,
+                val_data=val_data,
+                train_starts=train_starts,
+                eval_starts=eval_starts,
+                args=args,
+                device=device,
+                amp_dtype=amp_dtype,
+            )
         )
-    )
-    release_model(shoujen)
+        release_model(shoujen)
 
-    torch.manual_seed(args.seed)
-    gpt2 = build_gpt2_small(vocab_size, args.block_size)
-    results.append(
-        train_one(
-            name="gpt2-small",
-            model=gpt2,
-            train_data=train_data,
-            val_data=val_data,
-            train_starts=train_starts,
-            eval_starts=eval_starts,
-            args=args,
-            device=device,
-            amp_dtype=amp_dtype,
+    if "gpt2-small" in args.models:
+        torch.manual_seed(args.seed)
+        gpt2 = build_gpt2_small(vocab_size, args.block_size)
+        results.append(
+            train_one(
+                name="gpt2-small",
+                model=gpt2,
+                train_data=train_data,
+                val_data=val_data,
+                train_starts=train_starts,
+                eval_starts=eval_starts,
+                args=args,
+                device=device,
+                amp_dtype=amp_dtype,
+            )
         )
-    )
-    release_model(gpt2)
+        release_model(gpt2)
 
     print("\nsummary:", flush=True)
     for result in results:

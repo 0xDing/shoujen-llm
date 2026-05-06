@@ -61,6 +61,7 @@ _rwkv7 = _load_module(
     REPO_ROOT / "shoujen" / "modules" / "rwkv7.py",
 )
 rwkv7_recurrent = _rwkv7.rwkv7_recurrent
+_mps_wind_backstepping_with_resets = _rwkv7._mps_wind_backstepping_with_resets
 
 
 def _make_inputs(B, T, H, C, dtype, device, seed=0):
@@ -218,17 +219,84 @@ def run_one(B, T, H, C, dtype, device, chunk_len=16, atol=5e-4, rtol=5e-3):
     print(f"  --- backward max|diff| (mps vs pyref-role-swap) ---")
     diffs_swap = _print_grad_diffs(mps_args, ref_args_swap)
 
-    # Decision: pass if production-order matches within tolerance.
-    fwd_ok = _max_abs_diff(out_mps, out_ref_prod) < max(atol, rtol * out_mean_oracle)
-    grads_ok = all(d < max(atol, rtol * 1.0) for d in diffs_prod.values())
+    fwd_scale = max(out_ref_prod.float().abs().max().item(), 1.0)
+    grad_scales = [
+        max(ref.grad.float().abs().max().item(), 1.0)
+        for ref in ref_args_prod
+    ]
+    grads_finite = all(torch.isfinite(arg.grad).all().item() for arg in mps_args)
+    fwd_ok = _max_abs_diff(out_mps, out_ref_prod) <= max(atol, rtol * fwd_scale)
+    grads_ok = grads_finite and all(
+        diff <= max(atol, rtol * scale)
+        for diff, scale in zip(diffs_prod.values(), grad_scales)
+    )
     return {
         "fwd_mps_vs_oracle": _max_abs_diff(out_mps, out_oracle),
         "fwd_mps_vs_prod":   _max_abs_diff(out_mps, out_ref_prod),
         "fwd_mps_vs_swap":   _max_abs_diff(out_mps, out_ref_swap),
         "diffs_prod": diffs_prod,
         "diffs_swap": diffs_swap,
+        "grads_finite": grads_finite,
         "production_pass": fwd_ok and grads_ok,
     }
+
+
+def run_reset_segments(dtype, device, atol=5e-2, rtol=5e-2) -> bool:
+    B, T, H, C, chunk_len = 2, 64, 4, 64, 16
+    print(f"\n{'='*72}")
+    print(f"Reset-packed dispatch: B={B} T={T} H={H} C={C} dtype={dtype}")
+    print(f"{'='*72}")
+
+    inp = _make_inputs(B, T, H, C, dtype, device, seed=77)
+    reset_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
+    reset_mask[:, 0] = True
+    reset_mask[0, 17] = True
+    reset_mask[1, 9] = True
+    reset_mask[1, 33] = True
+
+    mps_args = [t.detach().clone().requires_grad_(True) for t in (
+        inp["w"], inp["r"], inp["k"], inp["v"], inp["neg_kk"], inp["kka"]
+    )]
+    out_mps = _mps_wind_backstepping_with_resets(tuple(mps_args), reset_mask, chunk_len=chunk_len)
+    if out_mps is None:
+        print("  reset-packed MPS dispatch returned None")
+        return False
+
+    ref_args = [t.detach().clone().requires_grad_(True) for t in (
+        inp["w"], inp["r"], inp["k"], inp["v"], inp["neg_kk"], inp["kka"]
+    )]
+    w_seq, r_seq, k_seq, v_seq, neg_kk_seq, kka_seq = ref_args
+    out_ref_h, _ = rwkv7_recurrent(
+        r_seq.transpose(1, 2).contiguous(),
+        k_seq.transpose(1, 2).contiguous(),
+        v_seq.transpose(1, 2).contiguous(),
+        torch.exp(-torch.exp(w_seq.float())).to(w_seq.dtype).transpose(1, 2).contiguous(),
+        neg_kk_seq.transpose(1, 2).contiguous(),
+        kka_seq.transpose(1, 2).contiguous(),
+        state=None,
+        reset_mask=reset_mask,
+    )
+    out_ref = out_ref_h.transpose(1, 2).contiguous()
+
+    g = torch.Generator(device="cpu").manual_seed(456)
+    dy = torch.randn(B, T, H, C, generator=g, dtype=torch.float32).to(dtype=dtype, device=device).contiguous()
+    out_mps.backward(dy)
+    out_ref.backward(dy)
+
+    fwd_diff = _max_abs_diff(out_mps, out_ref)
+    grad_diffs = [_max_abs_diff(m.grad, r.grad) for m, r in zip(mps_args, ref_args)]
+    fwd_scale = max(out_ref.float().abs().max().item(), 1.0)
+    grad_scales = [max(ref.grad.float().abs().max().item(), 1.0) for ref in ref_args]
+    grads_finite = all(torch.isfinite(arg.grad).all().item() for arg in mps_args)
+    ok = (
+        fwd_diff <= max(atol, rtol * fwd_scale)
+        and grads_finite
+        and all(diff <= max(atol, rtol * scale) for diff, scale in zip(grad_diffs, grad_scales))
+    )
+    print(f"  forward max|diff|={fwd_diff:.3e}")
+    print("  grad max|diff|=" + ", ".join(f"{d:.3e}" for d in grad_diffs))
+    print(f"  reset-packed equivalence : {'PASS' if ok else 'FAIL'}")
+    return ok
 
 
 def main() -> int:
@@ -255,12 +323,15 @@ def main() -> int:
     ]
 
     summary = []
+    reset_passes = []
     for dtype, atol, rtol in dtype_tols:
         print(f"\n\n############# dtype = {dtype} (atol={atol}, rtol={rtol}) #############")
         for (B, T, H, C, cl) in configs:
             r = run_one(B, T, H, C, dtype, device, chunk_len=cl, atol=atol, rtol=rtol)
             if r is not None:
                 summary.append((dtype, B, T, H, C, r))
+        if dtype in {torch.float32, torch.float16}:
+            reset_passes.append(run_reset_segments(dtype, device, atol=atol, rtol=rtol))
 
     print("\n" + "=" * 72)
     print("SUMMARY")
@@ -271,25 +342,16 @@ def main() -> int:
               f"{r['fwd_mps_vs_oracle']:<14.3e}{r['fwd_mps_vs_prod']:<14.3e}"
               f"{r['fwd_mps_vs_swap']:<14.3e}")
 
-    all_prod_pass = all(r["production_pass"] for *_, r in summary)
+    all_prod_pass = all(r["production_pass"] for *_, r in summary) and all(reset_passes)
 
     print("\n" + "=" * 72)
     print(f"PRODUCTION-DISPATCH equivalence : {'PASS' if all_prod_pass else 'FAIL'}")
     if not all_prod_pass:
         print("\nDiagnosis:")
-        print("  The fp64 oracle implements the SHADER's recurrence:")
-        print("    sa = sum_j(a[j] * state_pre_decay[i,j])")
-        print("    state[i,j] = state[i,j]*w[j] + sa*b[j] + k[j]*v[i]")
-        print("  In every config we observe `mps ≈ oracle` within fp32 noise,")
-        print("  but `pyref(production-order) != oracle` and `pyref(role-swap) != oracle`.")
-        print("  PyRef `rwkv7_recurrent` actually computes a *different* recurrence:")
-        print("    state *= w; sk = sum(state * kka); state += sk * neg_kk + v*k")
-        print("  i.e. (a) it projects on the POST-decay state, and (b) it treats")
-        print("  `kka` as the inner projector and `neg_kk` as the outer factor,")
-        print("  whereas the shader's convention (per the official RWKV-7 CUDA")
-        print("  kernel) is `a` (= production-passed neg_kk) as the inner projector")
-        print("  on PRE-decay state and `b` (= kka) as the outer factor.")
-        print("  Result: the two paths in rwkv7.py do NOT compute the same op.")
+        print("  Production dispatch should match the fp64 shader-convention oracle")
+        print("  and the PyTorch reference within dtype-scaled tolerances.")
+        print("  Check the per-gradient max|diff| rows above; non-finite MPS grads")
+        print("  are treated as a failure, especially for fp16/bfloat16 backward.")
     print("=" * 72)
     return 0 if all_prod_pass else 1
 

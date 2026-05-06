@@ -31,16 +31,18 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.train import build_config
 from shoujen.data import PackedParquetPretrainDataset, packed_collate
-from shoujen.losses import compute_lm_loss
+from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
 from shoujen.tokenizer import ShoujenTokenizer
 from shoujen.train_utils import (
     autocast_dtype,
     load_checkpoint,
+    move_tensor_to_device,
     pick_device,
     save_checkpoint,
     set_optimizer_lr,
+    warmup_stable_decay_lr,
     warmup_cosine_lr,
 )
 
@@ -77,11 +79,21 @@ def parse_args():
 
     p.add_argument("--muon-lr", type=float, default=3e-4)
     p.add_argument("--muon-ns-steps", type=int, default=5)
+    p.add_argument("--muon-adaptive", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--muon-adaptive-beta2", type=float, default=0.95)
+    p.add_argument("--muon-adaptive-eps", type=float, default=1e-8)
     p.add_argument("--adamw-lr", type=float, default=3e-4)
     p.add_argument("--muon-wd", type=float, default=0.0)
     p.add_argument("--adamw-wd", type=float, default=0.1)
+    p.add_argument("--adamw-independent-wd", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--adamw-embed-wd", type=float, default=0.0)
     p.add_argument("--adamw-foreach", action="store_true")
+    p.add_argument("--lr-schedule", choices=["cosine", "wsd"], default="cosine")
     p.add_argument("--lr-min-ratio", type=float, default=0.1)
+    p.add_argument("--lr-stable-steps", type=int, default=0)
+    p.add_argument("--qk-norm", action="store_true")
+    p.add_argument("--z-loss-weight", type=float, default=1e-4)
+    p.add_argument("--log-max-qk-logit", action="store_true")
 
     p.add_argument("--shuffle-buffer-size", type=int, default=10000)
     p.add_argument("--seed", type=int, default=1337)
@@ -131,7 +143,44 @@ def make_loader(
     )
 
 
-def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+def _valid_moved_batch(
+    batch: dict[str, torch.Tensor],
+    *,
+    vocab_size: int | None,
+    block_size: int | None,
+) -> bool:
+    if vocab_size is None:
+        return True
+    input_ids = batch["input_ids"]
+    labels = batch["labels"]
+    loss_mask = batch["loss_mask"]
+    position_ids = batch["position_ids"]
+
+    valid_inputs = ((input_ids >= 0) & (input_ids < vocab_size)).all()
+    valid_labels = ((labels == -100) | ((labels >= 0) & (labels < vocab_size))).all()
+    valid_loss_mask = torch.isfinite(loss_mask).all() & (loss_mask >= 0).all() & (loss_mask <= 1).all()
+    del block_size
+    valid_positions = (position_ids >= 0).all()
+    return bool((valid_inputs & valid_labels & valid_loss_mask & valid_positions).detach().cpu().item())
+
+
+def _batch_debug_stats(batch: dict[str, torch.Tensor]) -> str:
+    return (
+        f"input_ids=[{batch['input_ids'].min().item()}, {batch['input_ids'].max().item()}] "
+        f"labels=[{batch['labels'].min().item()}, {batch['labels'].max().item()}] "
+        f"loss_mask_sum={float(batch['loss_mask'].sum().item()):.6g} "
+        f"position_ids=[{batch['position_ids'].min().item()}, {batch['position_ids'].max().item()}]"
+    )
+
+
+def move_batch(
+    batch: dict[str, torch.Tensor],
+    device: torch.device,
+    *,
+    vocab_size: int | None = None,
+    block_size: int | None = None,
+    retries: int = 3,
+) -> dict[str, torch.Tensor]:
     keys = (
         "input_ids",
         "labels",
@@ -140,7 +189,16 @@ def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str
         "position_ids",
         "sequence_start_mask",
     )
-    return {k: batch[k].to(device, non_blocking=True) for k in keys}
+    for attempt in range(max(1, retries)):
+        moved = {k: move_tensor_to_device(batch[k], device) for k in keys}
+        if _valid_moved_batch(moved, vocab_size=vocab_size, block_size=block_size):
+            return moved
+        if device.type == "mps":
+            torch.mps.empty_cache()
+    raise RuntimeError(
+        "Invalid batch after device transfer; refusing to train on corrupted tensors. "
+        + _batch_debug_stats(moved)
+    )
 
 
 def maybe_init_wandb(
@@ -187,6 +245,22 @@ def make_autocast(device: torch.device, amp_dtype: torch.dtype | None):
     return torch.autocast(device_type=device.type, dtype=amp_dtype)
 
 
+def lr_multiplier(args: argparse.Namespace, step: int, max_steps: int) -> float:
+    if args.lr_schedule == "wsd":
+        return warmup_stable_decay_lr(
+            step,
+            warmup=args.warmup,
+            max_steps=max_steps,
+            stable_steps=args.lr_stable_steps,
+        )
+    return warmup_cosine_lr(
+        step,
+        warmup=args.warmup,
+        max_steps=max_steps,
+        min_ratio=args.lr_min_ratio,
+    )
+
+
 @torch.no_grad()
 def evaluate(
     model: ShoujenLM,
@@ -215,7 +289,12 @@ def evaluate(
     for batch in loader:
         if args.eval_batches and batches >= args.eval_batches:
             break
-        batch = move_batch(batch, device)
+        batch = move_batch(
+            batch,
+            device,
+            vocab_size=tokenizer.vocab_size,
+            block_size=args.block_size,
+        )
         with make_autocast(device, amp_dtype):
             outputs = model(
                 batch["input_ids"],
@@ -225,7 +304,7 @@ def evaluate(
                 use_cache=False,
             )
             loss, active_tokens = compute_lm_loss(
-                outputs.logits,
+                outputs.logits.float(),
                 batch["labels"],
                 loss_mask=batch["loss_mask"],
                 ignore_index=-100,
@@ -285,6 +364,8 @@ def main():
 
     tokenizer = ShoujenTokenizer.load(args.vocab)
     config = build_config(args, tokenizer)
+    if args.qk_norm:
+        config.qk_norm = True
     config.to_json(out_dir / "config.json")
 
     model = ShoujenLM(config).to(device)
@@ -295,8 +376,12 @@ def main():
         muon_lr=args.muon_lr,
         muon_ns_steps=args.muon_ns_steps,
         muon_wd=args.muon_wd,
+        muon_adaptive=args.muon_adaptive,
+        muon_adaptive_beta2=args.muon_adaptive_beta2,
+        muon_adaptive_eps=args.muon_adaptive_eps,
         adamw_lr=args.adamw_lr,
         adamw_wd=args.adamw_wd,
+        adamw_embed_wd=args.adamw_embed_wd if args.adamw_independent_wd else None,
         adamw_foreach=True if args.adamw_foreach else None,
     )
     base_muon_lrs = [g["lr"] for g in muon.param_groups]
@@ -317,6 +402,7 @@ def main():
 
     wandb_run = maybe_init_wandb(args, config, train_paths, val_path)
     model.train()
+    model.set_track_max_qk_logit(args.log_max_qk_logit)
     last_log_t = time.time()
     last_log_tokens = 0
     schedule_steps = max(1, args.lr_schedule_steps)
@@ -345,13 +431,13 @@ def main():
             if args.max_steps_per_stage and stage_step >= args.max_steps_per_stage:
                 break
 
-            batch = move_batch(batch, device)
-            mult = warmup_cosine_lr(
-                global_step,
-                warmup=args.warmup,
-                max_steps=schedule_steps,
-                min_ratio=args.lr_min_ratio,
+            batch = move_batch(
+                batch,
+                device,
+                vocab_size=tokenizer.vocab_size,
+                block_size=args.block_size,
             )
+            mult = lr_multiplier(args, global_step, schedule_steps)
             set_optimizer_lr(muon, base_muon_lrs, mult)
             set_optimizer_lr(adamw, base_adamw_lrs, mult)
 
@@ -364,17 +450,29 @@ def main():
                     use_cache=False,
                 )
                 lm_loss, active_tokens = compute_lm_loss(
-                    outputs.logits,
+                    outputs.logits.float(),
                     batch["labels"],
                     loss_mask=batch["loss_mask"],
                     ignore_index=-100,
                 )
+                total_loss = lm_loss
+                z_loss = None
+                if args.z_loss_weight:
+                    z_loss = compute_z_loss(
+                        outputs.logits,
+                        batch["labels"],
+                        loss_mask=batch["loss_mask"],
+                        ignore_index=-100,
+                    )
+                    total_loss = total_loss + args.z_loss_weight * z_loss
 
             muon.zero_grad(set_to_none=True)
             adamw.zero_grad(set_to_none=True)
-            lm_loss.backward()
+            total_loss.backward()
             if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if not torch.isfinite(grad_norm):
+                    raise RuntimeError(f"Non-finite gradient norm at step {global_step + 1}: {grad_norm.item()}")
             muon.step()
             adamw.step()
 
@@ -385,21 +483,35 @@ def main():
             if args.log_every and global_step % args.log_every == 0:
                 dt = time.time() - last_log_t
                 tok_per_sec = last_log_tokens / max(dt, 1e-6)
+                extras = ""
+                if args.z_loss_weight and z_loss is not None:
+                    extras += f" z={z_loss.item():.4f} total={total_loss.item():.4f}"
+                max_qk = None
+                if args.log_max_qk_logit:
+                    max_qk = model.max_qk_logit()
+                    if max_qk is not None:
+                        extras += f" max_qk={max_qk:.2f}"
                 print(
                     f"stage={stage_name} step={global_step} stage_step={stage_step} "
-                    f"lm={lm_loss.item():.4f} lr_mult={mult:.3f} tok/s={tok_per_sec:.0f}",
+                    f"lm={lm_loss.item():.4f}{extras} lr_mult={mult:.3f} tok/s={tok_per_sec:.0f}",
                     flush=True,
                 )
+                wandb_payload = {
+                    "train/lm_loss": float(lm_loss.item()),
+                    "train/active_tokens": float(active_tokens.item()),
+                    "train/lr_multiplier": mult,
+                    "train/tok_per_sec": tok_per_sec,
+                    "stage/index": stage_idx,
+                    "stage/step": stage_step,
+                }
+                if z_loss is not None:
+                    wandb_payload["train/z_loss"] = float(z_loss.item())
+                    wandb_payload["train/total_loss"] = float(total_loss.item())
+                if max_qk is not None:
+                    wandb_payload["train/max_qk_logit"] = max_qk
                 log_wandb(
                     wandb_run,
-                    {
-                        "train/lm_loss": float(lm_loss.item()),
-                        "train/active_tokens": float(active_tokens.item()),
-                        "train/lr_multiplier": mult,
-                        "train/tok_per_sec": tok_per_sec,
-                        "stage/index": stage_idx,
-                        "stage/step": stage_step,
-                    },
+                    wandb_payload,
                     global_step,
                 )
                 last_log_t = time.time()

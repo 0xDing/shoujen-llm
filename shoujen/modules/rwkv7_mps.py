@@ -273,13 +273,13 @@ class MPSWindBackstepping(torch.autograd.Function):
         chunk_len: int = 16,
     ) -> torch.Tensor:
         if not can_use_mps_wind_backstepping(w, q, k, v, a, b, chunk_len=chunk_len):
-            raise RuntimeError("MPS wind-backstepping requires contiguous fp32 MPS tensors [B,T,H,C]")
+            raise RuntimeError("MPS wind-backstepping requires contiguous MPS tensors [B,T,H,C]")
 
         B, T, H, C = w.shape
         lib = _compile_wind_backstepping_shader(C, chunk_len, _metal_dtype(w.dtype))
         y = torch.empty_like(v)
         s = torch.empty((B, H, T // chunk_len, C, C), device=w.device, dtype=torch.float32)
-        sa = torch.empty_like(w)
+        sa = torch.empty(w.shape, device=w.device, dtype=torch.float32)
         lib.rwkv7_forward(
             w,
             q,

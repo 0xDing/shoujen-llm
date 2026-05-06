@@ -9,12 +9,20 @@ explicit before the recurrent loop.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from shoujen.modules.rwkv7_cuda import can_use_cuda_wind_backstepping, cuda_wind_backstepping
 from shoujen.modules.rwkv7_mps import can_use_mps_wind_backstepping, mps_wind_backstepping
+
+
+MPS_WIND_BACKSTEPPING_CHUNK_LEN = 16
+CUDA_WIND_BACKSTEPPING_CHUNK_LEN = 16
+_warned_cuda_wind_backstepping = False
+_cuda_wind_backstepping_disabled = False
 
 
 def _round_lora_dim(value: float) -> int:
@@ -100,6 +108,136 @@ def rwkv7_recurrent(
         out[:, :, t] = (state * rt.unsqueeze(-2)).sum(-1)
 
     return out.to(dtype), state
+
+
+def _pad_wind_args(
+    args: tuple[torch.Tensor, ...],
+    *,
+    chunk_len: int = MPS_WIND_BACKSTEPPING_CHUNK_LEN,
+) -> tuple[tuple[torch.Tensor, ...], int]:
+    seq_len = args[0].shape[1]
+    pad_len = (-seq_len) % chunk_len
+    if pad_len:
+        args = tuple(F.pad(tensor, (0, 0, 0, 0, 0, pad_len)) for tensor in args)
+    return args, pad_len
+
+
+def _mps_wind_backstepping_padded(
+    args: tuple[torch.Tensor, ...],
+    *,
+    chunk_len: int = MPS_WIND_BACKSTEPPING_CHUNK_LEN,
+) -> torch.Tensor | None:
+    seq_len = args[0].shape[1]
+    padded_args, pad_len = _pad_wind_args(args, chunk_len=chunk_len)
+    if not can_use_mps_wind_backstepping(*padded_args, chunk_len=chunk_len):
+        return None
+    out = mps_wind_backstepping(*padded_args, chunk_len=chunk_len)
+    return out[:, :seq_len] if pad_len else out
+
+
+def _mps_wind_backstepping_with_resets(
+    args: tuple[torch.Tensor, ...],
+    reset_mask: torch.Tensor,
+    *,
+    chunk_len: int = MPS_WIND_BACKSTEPPING_CHUNK_LEN,
+) -> torch.Tensor | None:
+    """Run reset-packed sequences as independent Metal-kernel segments.
+
+    The Metal op starts from zero recurrent state and does not accept a reset
+    mask. During packed pretraining every reset boundary also starts a new
+    document with zero RWKV state, so we can preserve semantics by slicing each
+    sample into reset-free spans and launching the same op per span.
+    """
+    bsz, seq_len = reset_mask.shape
+    reset_cpu = reset_mask.detach().to(device="cpu", dtype=torch.bool)
+    rows: list[torch.Tensor] = []
+    for batch_idx in range(bsz):
+        starts = reset_cpu[batch_idx].nonzero(as_tuple=False).flatten().tolist()
+        starts = [start for start in starts if 0 <= start < seq_len]
+        if not starts or starts[0] != 0:
+            starts.insert(0, 0)
+        if starts[-1] != seq_len:
+            starts.append(seq_len)
+
+        pieces: list[torch.Tensor] = []
+        for start, end in zip(starts, starts[1:]):
+            if end <= start:
+                continue
+            segment_args = tuple(tensor[batch_idx : batch_idx + 1, start:end].contiguous() for tensor in args)
+            segment_out = _mps_wind_backstepping_padded(segment_args, chunk_len=chunk_len)
+            if segment_out is None:
+                return None
+            pieces.append(segment_out)
+        if not pieces:
+            return None
+        rows.append(torch.cat(pieces, dim=1))
+    return torch.cat(rows, dim=0)
+
+
+def _warn_cuda_wind_backstepping_failure(exc: Exception) -> None:
+    global _cuda_wind_backstepping_disabled, _warned_cuda_wind_backstepping
+    _cuda_wind_backstepping_disabled = True
+    if _warned_cuda_wind_backstepping:
+        return
+    _warned_cuda_wind_backstepping = True
+    warnings.warn(
+        "CUDA RWKV7 wind-backstepping failed to initialize; falling back to "
+        f"PyTorch recurrence. Original error: {exc}",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def _cuda_wind_backstepping_padded(
+    args: tuple[torch.Tensor, ...],
+    *,
+    chunk_len: int = CUDA_WIND_BACKSTEPPING_CHUNK_LEN,
+) -> torch.Tensor | None:
+    if _cuda_wind_backstepping_disabled:
+        return None
+    seq_len = args[0].shape[1]
+    padded_args, pad_len = _pad_wind_args(args, chunk_len=chunk_len)
+    if not can_use_cuda_wind_backstepping(*padded_args, chunk_len=chunk_len):
+        return None
+    try:
+        out = cuda_wind_backstepping(*padded_args, chunk_len=chunk_len)
+    except Exception as exc:  # pragma: no cover - depends on local CUDA toolkit
+        _warn_cuda_wind_backstepping_failure(exc)
+        return None
+    return out[:, :seq_len] if pad_len else out
+
+
+def _cuda_wind_backstepping_with_resets(
+    args: tuple[torch.Tensor, ...],
+    reset_mask: torch.Tensor,
+    *,
+    chunk_len: int = CUDA_WIND_BACKSTEPPING_CHUNK_LEN,
+) -> torch.Tensor | None:
+    """Run reset-packed sequences as independent CUDA-kernel segments."""
+    bsz, seq_len = reset_mask.shape
+    reset_cpu = reset_mask.detach().to(device="cpu", dtype=torch.bool)
+    rows: list[torch.Tensor] = []
+    for batch_idx in range(bsz):
+        starts = reset_cpu[batch_idx].nonzero(as_tuple=False).flatten().tolist()
+        starts = [start for start in starts if 0 <= start < seq_len]
+        if not starts or starts[0] != 0:
+            starts.insert(0, 0)
+        if starts[-1] != seq_len:
+            starts.append(seq_len)
+
+        pieces: list[torch.Tensor] = []
+        for start, end in zip(starts, starts[1:]):
+            if end <= start:
+                continue
+            segment_args = tuple(tensor[batch_idx : batch_idx + 1, start:end].contiguous() for tensor in args)
+            segment_out = _cuda_wind_backstepping_padded(segment_args, chunk_len=chunk_len)
+            if segment_out is None:
+                return None
+            pieces.append(segment_out)
+        if not pieces:
+            return None
+        rows.append(torch.cat(pieces, dim=1))
+    return torch.cat(rows, dim=0)
 
 
 class RWKV7TimeMix(nn.Module):
@@ -233,15 +371,14 @@ class RWKV7TimeMix(nn.Module):
         neg_kk_seq = (-kk).contiguous()
         kka_seq = (kk.reshape(bsz, seq_len, hidden_size) * a).view(bsz, seq_len, n_head, head_dim).contiguous()
 
-        mps_pad_len = 0
         if recurrent_state is None:
             # Autocast leaves the elementwise RWKV tensors in mixed dtypes
-            # because they interact with fp32 parameters. The Metal shader uses
+            # because they interact with fp32 parameters. The fused kernels use
             # one scalar_t for all six inputs, while still accumulating state in
-            # fp32 internally, so normalize only the shader boundary.
-            mps_dtype = r_seq.dtype
-            mps_args = tuple(
-                tensor if tensor.dtype == mps_dtype else tensor.to(dtype=mps_dtype)
+            # fp32 internally, so normalize only the kernel boundary.
+            kernel_dtype = r_seq.dtype
+            kernel_args = tuple(
+                tensor if tensor.dtype == kernel_dtype else tensor.to(dtype=kernel_dtype)
                 for tensor in (
                     w_seq,
                     r_seq,
@@ -251,25 +388,23 @@ class RWKV7TimeMix(nn.Module):
                     kka_seq,
                 )
             )
-            mps_pad_len = (-seq_len) % 16
-            if mps_pad_len:
-                mps_args = tuple(F.pad(tensor, (0, 0, 0, 0, 0, mps_pad_len)) for tensor in mps_args)
         else:
-            mps_args = ()
+            kernel_args = ()
         has_internal_resets = False
         if sequence_start_mask is not None and seq_len > 1:
             has_internal_resets = bool(sequence_start_mask[:, 1:].any().detach().cpu().item())
-        if (
-            mps_args
-            and not has_internal_resets
-            and can_use_mps_wind_backstepping(*mps_args, chunk_len=16)
-        ):
-            out_seq = mps_wind_backstepping(
-                *mps_args,
-                chunk_len=16,
-            )
-            if mps_pad_len:
-                out_seq = out_seq[:, :seq_len]
+
+        out_seq = None
+        if kernel_args and not has_internal_resets:
+            out_seq = _cuda_wind_backstepping_padded(kernel_args)
+            if out_seq is None:
+                out_seq = _mps_wind_backstepping_padded(kernel_args)
+        elif kernel_args and sequence_start_mask is not None:
+            out_seq = _cuda_wind_backstepping_with_resets(kernel_args, sequence_start_mask)
+            if out_seq is None:
+                out_seq = _mps_wind_backstepping_with_resets(kernel_args, sequence_start_mask)
+
+        if out_seq is not None:
             new_recurrent_state = None
         else:
             rh = r_seq.transpose(1, 2).contiguous()
@@ -290,11 +425,12 @@ class RWKV7TimeMix(nn.Module):
             )
             out_seq = out_h.transpose(1, 2).contiguous()
 
-        rk_bonus = (r_seq * k_seq * self.r_k.view(1, 1, n_head, head_dim)).sum(dim=-1, keepdim=True) * v_seq
-        out_seq = out_seq + rk_bonus
-
         out = out_seq.reshape(bsz, seq_len, hidden_size)
         out = self.ln_x(out.view(bsz * seq_len, hidden_size)).view(bsz, seq_len, hidden_size)
+
+        rk_bonus = (r_seq * k_seq * self.r_k.view(1, 1, n_head, head_dim)).sum(dim=-1, keepdim=True) * v_seq
+        out = out + rk_bonus.reshape(bsz, seq_len, hidden_size)
+
         out = self.output(out * g)
 
         new_prev_token = x[:, -1:, :].detach()

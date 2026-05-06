@@ -49,6 +49,22 @@ def compute_lm_loss(
     return loss, denom
 
 
+def compute_z_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Mean squared log-partition value over the active LM loss positions."""
+    log_z = torch.logsumexp(logits.float(), dim=-1)
+    keep = (labels != ignore_index).float()
+    if loss_mask is not None:
+        keep = keep * loss_mask.float()
+
+    denom = keep.sum().clamp(min=1.0)
+    return (log_z.square() * keep).sum() / denom
+
+
 class SemanticTubePredictionLoss(nn.Module):
     def __init__(
         self,

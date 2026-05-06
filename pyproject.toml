@@ -13,11 +13,15 @@ dependencies = [
     "safetensors>=0.4.5",
     "pyyaml>=6.0",
     "transformers>=4.57.0",
+    "accelerate>=1.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+]
+hpo = [
+    "optuna>=4.0",
 ]
 
 [build-system]

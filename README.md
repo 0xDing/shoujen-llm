@@ -69,7 +69,6 @@ Text-only causal LM. Architecturally close to Qwen3.5, but with [RWKV7](https://
 - FFN = SwiGLU, `intermediate_size = 2048`
 - norm = RMSNorm
 - residual = Block Attention Residuals, `attnres_n_blocks = 4`
-- Per-Layer Embeddings = low-rank PLE, `ple_dim = 24`
 - token embedding and LM head tied
 - `max_seq_len = 2048`
 
@@ -88,9 +87,6 @@ Text-only causal LM. Architecturally close to Qwen3.5, but with [RWKV7](https://
 **Block Attention Residuals (Moonshot-style).**
 - Standard pre-norm transformers exhibit "residual stream takeover" at depth — later layers struggle to overwrite low-frequency directions deposited early. Block residuals every 4 layers act as a periodic refresh that lets later attention blocks read a less-saturated stream. Cheap to add, measurably helps with deep-and-narrow shapes.
 
-**Per-Layer Embeddings (Gemma4-style, low-rank).**
-- Each layer gets its own tiny `ple_dim = 24` embedding lookup that is added into the hidden state. With character-level vocab the input embedding is already token-identity-rich, but PLE gives each layer a learned, layer-specific bias keyed on the input token — useful in a deep model where the same character should mean slightly different things at layer 3 vs layer 20. Cost is `vocab_size × ple_dim × num_layers`, which is small relative to the main embedding matrix.
-
 **Tied embeddings + RMSNorm + RoPE.**
 - Standard small-model defaults; RoPE because the attention layers need positional information that RWKV layers can't supply implicitly across the full window.
 
@@ -101,18 +97,102 @@ Apple M1 Ultra, PyTorch MPS.
 
 Optimizer:
 - Muon for hidden 2D matrices.
-- AdamW for embeddings, PLE, norms, biases, gates, and small parameter groups.
+- AdamW for embeddings, norms, biases, gates, and small parameter groups.
 
 Training objectives:
 - Primary loss: next-token cross-entropy.
 - SFT stage: assistant-only loss (mask provided by the chat-template encoder).
 - Auxiliary loss: [Semantic Tube Prediction](https://github.com/galilai-group/llm-jepa#stp) is reserved for a future SFT path where message-local spans are available. It is not applied during packed pretraining, because random STP triples must not cross unrelated documents.
 
+### Trainer-based packed pretraining
+
+The staged parquet pretraining path also has a Transformers `Trainer` entrypoint:
+
+```bash
+uv run python scripts/train_trainer_staged_packed.py \
+  --vocab data/vocab.json \
+  --data-dir data/processed-clean \
+  --batch-size 3 \
+  --gradient-accumulation-steps 1 \
+  --no-gradient-checkpointing
+```
+
+On the local Apple M1 Max / 64GB probe with `block_size=2048`, fp16 AMP, and
+real packed parquet short-run loss checks, the loss-aware default is:
+
+- `batch_size=3`
+- `gradient_accumulation_steps=1`
+- `gradient_checkpointing=false`
+
+The 64k-token batch-loss probe gave:
+
+| candidate | val loss | tok/s | driver memory |
+| --- | ---: | ---: | ---: |
+| `batch=3, accum=1, checkpointing=false` | 8.7628 | 903 | 31.9GB |
+| `batch=3, accum=1, checkpointing=true` | 8.7626 | 881 | 24.4GB |
+| `batch=4, accum=1, checkpointing=false` | 8.9375 | 911 | 40.5GB |
+| `batch=4, accum=2, checkpointing=false` | 9.1327 | 935 | 41.2GB |
+
+Use `batch_size=4` only when peak throughput matters more than the short-run
+loss signal. Use `batch_size=3 --gradient-checkpointing` when extra MPS memory
+headroom matters. Do not use gradient accumulation by default; in the short
+probe it increased the effective batch but did not improve loss.
+
+### CUDA RWKV7 kernel
+
+On CUDA, RWKV7 time-mixing now tries a runtime-compiled wind-backstepping
+extension adapted from BlinkDL's RWKV-v7 reference CUDA kernel before falling
+back to the transparent PyTorch recurrence. The first CUDA run compiles one
+extension per `(dtype, head_dim, chunk_len)` combination and caches it under the
+normal PyTorch extension cache.
+
+Prerequisites:
+- CUDA PyTorch with a matching local CUDA toolkit / `nvcc`
+- `ninja` available to `torch.utils.cpp_extension`
+- contiguous `[B, T, H, C]` tensors with `T` padded to the internal chunk length
+
+Useful controls:
+- `SHOUJEN_RWKV7_CUDA=0` disables the CUDA kernel path.
+- `SHOUJEN_RWKV7_CUDA_VERBOSE=1` prints extension build logs.
+- `uv run python scripts/test_rwkv7_cuda_equivalence.py` checks CUDA vs the
+  PyTorch reference on a CUDA machine.
+
+### Hyperparameter search
+
+The formal staged pretraining path can be searched with:
+
+```bash
+uv run python scripts/hpo_train_staged_packed.py \
+  --backend random \
+  --n-trials 4 \
+  --trial-steps 80 \
+  --eval-every 40 \
+  --eval-batches 8
+```
+
+For Optuna-backed search, install the optional HPO dependency first:
+
+```bash
+uv sync --extra hpo
+uv run python scripts/hpo_train_staged_packed.py \
+  --backend optuna \
+  --n-trials 20 \
+  --trial-steps 300 \
+  --eval-every 100 \
+  --eval-batches 20
+```
+
+The search reinitializes the model for every trial, samples staged parquet
+training shards, evaluates on `s0-val.parquet`, and ranks trials by a composite
+objective: validation loss, token throughput, and stability penalties from
+AMP choice, gradient clipping, loss volatility, and optional QK logit tracking.
+Results are written under `runs/hpo-staged-packed/`, including `summary.json`
+and `best_train_command.txt` for the full training run with the selected
+parameters.
+
 ## References
 
 - https://github.com/MoonshotAI/Attention-Residuals
 - https://arxiv.org/abs/2602.22617
 - https://arxiv.org/abs/2502.16982
-- https://www.reddit.com/r/LocalLLaMA/comments/1sd5utm/perlayer_embeddings_a_simple_explanation_of_the/
-- https://github.com/huggingface/transformers/pull/45207/changes
 - https://github.com/0xDing/shoujen-rnn — the RNN-era predecessor

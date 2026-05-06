@@ -4,13 +4,11 @@ The implementation follows the Qwen3.5 text-model shape: a `PreTrainedModel`
 backbone plus a causal-LM wrapper. The local architectural changes are:
 
 * RWKV7 x070 layers in place of Qwen3.5's linear-attention layers.
-* Gemma4-style Per-Layer Embeddings (PLE).
 * Moonshot Block Attention Residuals over depth.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -152,6 +150,10 @@ class ShoujenAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_norm = RMSNorm(self.head_dim, config.qk_norm_eps) if config.qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim, config.qk_norm_eps) if config.qk_norm else None
+        self.track_max_qk_logit = False
+        self.last_max_qk_logit: float | None = None
 
     def forward(
         self,
@@ -169,6 +171,10 @@ class ShoujenAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(*input_shape, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(*input_shape, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
+        if self.q_norm is not None:
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
+
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -181,8 +187,11 @@ class ShoujenAttention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = None
-        if hidden_states.device.type == "mps" or output_attentions:
+        self.last_max_qk_logit = None
+        if hidden_states.device.type == "mps" or output_attentions or self.track_max_qk_logit:
             scores = (query_states * self.scaling) @ key_states.transpose(-2, -1)
+            if self.track_max_qk_logit:
+                self.last_max_qk_logit = float(scores.detach().float().amax().item())
             if attention_mask is not None:
                 scores = scores + attention_mask
             attn_weights = torch.softmax(scores.float(), dim=-1).to(query_states.dtype)
@@ -264,12 +273,6 @@ class ShoujenDecoderLayer(nn.Module):
             self.token_mixer = RWKV7TimeMix(config, layer_idx)
 
         self.mlp = ShoujenMLP(config)
-        self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
-        if self.hidden_size_per_layer_input:
-            self.per_layer_input_gate = nn.Linear(config.hidden_size, self.hidden_size_per_layer_input, bias=False)
-            self.per_layer_projection = nn.Linear(self.hidden_size_per_layer_input, config.hidden_size, bias=False)
-            self.post_per_layer_input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-            self.act_fn = ACT2FN[config.hidden_act]
 
     def apply_token_mixer(
         self,
@@ -315,26 +318,6 @@ class ShoujenDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         return self.mlp(hidden_states)
 
-    def apply_per_layer_input(self, hidden_states: torch.Tensor, per_layer_input: torch.Tensor | None) -> torch.Tensor:
-        if not self.hidden_size_per_layer_input or per_layer_input is None:
-            return hidden_states
-        residual = hidden_states
-        hidden_states = self.per_layer_input_gate(hidden_states)
-        hidden_states = self.act_fn(hidden_states) * per_layer_input
-        hidden_states = self.per_layer_projection(hidden_states)
-        hidden_states = self.post_per_layer_input_norm(hidden_states)
-        return residual + hidden_states
-
-
-class ShoujenScaledWordEmbedding(nn.Embedding):
-    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int | None, embed_scale: float = 1.0):
-        super().__init__(num_embeddings, embedding_dim, padding_idx=padding_idx)
-        self.scalar_embed_scale = embed_scale
-        self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)
-
 
 class ShoujenPreTrainedModel(PreTrainedModel):
     config_class = ShoujenConfig
@@ -356,8 +339,6 @@ class ShoujenPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
-        elif isinstance(module, ShoujenScaledWordEmbedding):
-            module.embed_scale.fill_(module.scalar_embed_scale)
 
 
 class ShoujenModel(ShoujenPreTrainedModel):
@@ -374,23 +355,6 @@ class ShoujenModel(ShoujenPreTrainedModel):
         self.gradient_checkpointing = False
         self._causal_mask_cache: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
 
-        self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
-        if self.hidden_size_per_layer_input:
-            self.embed_tokens_per_layer = ShoujenScaledWordEmbedding(
-                config.vocab_size_per_layer_input,
-                config.num_hidden_layers * self.hidden_size_per_layer_input,
-                self.padding_idx,
-                embed_scale=self.hidden_size_per_layer_input**0.5,
-            )
-            self.per_layer_input_scale = 2.0**-0.5
-            self.per_layer_model_projection = nn.Linear(
-                config.hidden_size,
-                config.num_hidden_layers * self.hidden_size_per_layer_input,
-                bias=False,
-            )
-            self.per_layer_model_projection_scale = config.hidden_size**-0.5
-            self.per_layer_projection_norm = RMSNorm(self.hidden_size_per_layer_input, config.rms_norm_eps)
-
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -399,141 +363,18 @@ class ShoujenModel(ShoujenPreTrainedModel):
     def set_input_embeddings(self, value: nn.Embedding) -> None:
         self.embed_tokens = value
 
-    def get_per_layer_input_embeddings(self) -> nn.Embedding | None:
-        return getattr(self, "embed_tokens_per_layer", None)
+    def set_track_max_qk_logit(self, enabled: bool) -> None:
+        for layer in self.layers:
+            if layer.is_attention:
+                layer.token_mixer.track_max_qk_logit = enabled
 
-    def set_per_layer_input_embeddings(self, value: nn.Embedding) -> None:
-        self.embed_tokens_per_layer = value
-        self.config.vocab_size_per_layer_input = value.num_embeddings
-
-    def _recover_input_ids_from_inputs_embeds(self, inputs_embeds: torch.Tensor) -> torch.LongTensor:
-        """Recover token ids when inputs_embeds are exact rows from embed_tokens.
-
-        Shoujen is char-level, so the vocab is small enough that an exact row
-        lookup is practical for generation-style inputs. This avoids the
-        quadratic compare used by Gemma4 while still refusing soft/custom
-        embeddings that cannot carry token-identity PLE without explicit ids.
-        """
-        if inputs_embeds.shape[-1] != self.config.hidden_size:
-            raise ValueError(
-                f"inputs_embeds last dimension {inputs_embeds.shape[-1]} does not match "
-                f"hidden_size {self.config.hidden_size}"
-            )
-
-        embedding_weight = self.embed_tokens.weight.detach()
-        embed_scale = getattr(self.embed_tokens, "embed_scale", None)
-        if embed_scale is not None:
-            embedding_weight = embedding_weight * embed_scale.to(
-                device=embedding_weight.device,
-                dtype=embedding_weight.dtype,
-            )
-
-        # Match in the provided dtype so exact rows still recover under the
-        # same dtype conversion that produced inputs_embeds.
-        weight_cpu = embedding_weight.to(dtype=inputs_embeds.dtype, device="cpu").contiguous()
-        flat_inputs = inputs_embeds.detach().to(device="cpu").contiguous().reshape(-1, inputs_embeds.shape[-1])
-
-        ambiguous = object()
-        row_to_id: dict[bytes, int | object] = {}
-        for idx, row in enumerate(weight_cpu):
-            key = row.view(torch.uint8).numpy().tobytes()
-            row_to_id[key] = ambiguous if key in row_to_id else idx
-
-        recovered: list[int] = []
-        missing = 0
-        duplicate = 0
-        for row in flat_inputs:
-            key = row.view(torch.uint8).numpy().tobytes()
-            token_id = row_to_id.get(key)
-            if token_id is None:
-                missing += 1
-                recovered.append(0)
-            elif token_id is ambiguous:
-                duplicate += 1
-                recovered.append(0)
-            else:
-                recovered.append(int(token_id))
-
-        if missing or duplicate:
-            raise RuntimeError(
-                "inputs_embeds-only forward cannot compute token-identity PLE because the embeddings "
-                "do not exactly match unique rows in embed_tokens. Pass input_ids together with inputs_embeds, "
-                "or pass precomputed per_layer_inputs. "
-                f"missing_rows={missing} duplicate_rows={duplicate}"
-            )
-
-        return torch.tensor(recovered, dtype=torch.long, device=inputs_embeds.device).reshape(inputs_embeds.shape[:-1])
-
-    def _resize_per_layer_input_embeddings(
-        self,
-        new_num_tokens: int,
-        mean_resizing: bool = True,
-    ) -> nn.Embedding | None:
-        if not self.hidden_size_per_layer_input:
-            return None
-        old_embeddings = self.get_per_layer_input_embeddings()
-        if old_embeddings is None:
-            return None
-
-        if old_embeddings.num_embeddings == new_num_tokens:
-            self.config.vocab_size_per_layer_input = new_num_tokens
-            return old_embeddings
-
-        new_embeddings = self._get_resized_embeddings(
-            old_embeddings,
-            new_num_tokens,
-            pad_to_multiple_of=None,
-            mean_resizing=mean_resizing,
-        )
-        new_embeddings.requires_grad_(old_embeddings.weight.requires_grad)
-        self.set_per_layer_input_embeddings(new_embeddings)
-        self.config.vocab_size_per_layer_input = new_embeddings.num_embeddings
-        return new_embeddings
-
-    def resize_token_embeddings(
-        self,
-        new_num_tokens: int | None = None,
-        pad_to_multiple_of: int | None = None,
-        mean_resizing: bool = True,
-    ) -> nn.Embedding:
-        model_embeds = super().resize_token_embeddings(new_num_tokens, pad_to_multiple_of, mean_resizing)
-        self._resize_per_layer_input_embeddings(model_embeds.num_embeddings, mean_resizing=mean_resizing)
-        return model_embeds
-
-    def get_per_layer_inputs(
-        self,
-        input_ids: torch.Tensor | None,
-        inputs_embeds: torch.Tensor | None,
-    ) -> torch.Tensor | None:
-        if not self.hidden_size_per_layer_input:
-            return None
-        if input_ids is None:
-            if inputs_embeds is None:
-                return None
-            input_ids = self._recover_input_ids_from_inputs_embeds(inputs_embeds)
-        return self.embed_tokens_per_layer(input_ids).reshape(
-            *input_ids.shape,
-            self.config.num_hidden_layers,
-            self.hidden_size_per_layer_input,
-        )
-
-    def project_per_layer_inputs(
-        self,
-        inputs_embeds: torch.Tensor,
-        per_layer_inputs: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
-        if not self.hidden_size_per_layer_input:
-            return None
-        per_layer_projection = self.per_layer_model_projection(inputs_embeds) * self.per_layer_model_projection_scale
-        per_layer_projection = per_layer_projection.reshape(
-            *inputs_embeds.shape[:-1],
-            self.config.num_hidden_layers,
-            self.hidden_size_per_layer_input,
-        )
-        per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
-        if per_layer_inputs is None:
-            return per_layer_projection
-        return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
+    def max_qk_logit(self) -> float | None:
+        values = [
+            layer.token_mixer.last_max_qk_logit
+            for layer in self.layers
+            if layer.is_attention and layer.token_mixer.last_max_qk_logit is not None
+        ]
+        return max(values) if values else None
 
     def _to_hybrid_cache(
         self,
@@ -628,7 +469,6 @@ class ShoujenModel(ShoujenPreTrainedModel):
         sequence_start_mask: torch.Tensor | None = None,
         past_key_values: ShoujenHybridCache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        per_layer_inputs: torch.Tensor | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
@@ -646,6 +486,8 @@ class ShoujenModel(ShoujenPreTrainedModel):
         output_hidden_states = bool(output_hidden_states or return_hidden_states)
         return_dict = True if return_dict is None else return_dict
         use_cache = self.config.use_cache if use_cache is None else use_cache
+        if self.gradient_checkpointing and self.training and use_cache:
+            use_cache = False
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -654,11 +496,6 @@ class ShoujenModel(ShoujenPreTrainedModel):
                 f"input_ids shape {tuple(input_ids.shape)} must match inputs_embeds shape "
                 f"{tuple(inputs_embeds.shape[:-1])} when both are provided"
             )
-
-        if self.hidden_size_per_layer_input:
-            if per_layer_inputs is None:
-                per_layer_inputs = self.get_per_layer_inputs(input_ids, inputs_embeds)
-            per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
 
         cache = self._to_hybrid_cache(past_key_values, attn_caches, rwkv_states, v_first)
         past_seen_tokens = cache.get_seq_length() if cache is not None else 0
@@ -734,10 +571,23 @@ class ShoujenModel(ShoujenPreTrainedModel):
             )
             partial_block = mixer_out if partial_block is None else partial_block + mixer_out
 
-            mlp_input = decoder_layer.mlp_res(completed_blocks, partial_block)
-            partial_block = partial_block + decoder_layer.apply_mlp(mlp_input)
-            per_layer_input = per_layer_inputs[:, :, layer_idx, :] if per_layer_inputs is not None else None
-            partial_block = decoder_layer.apply_per_layer_input(partial_block, per_layer_input)
+            if self.gradient_checkpointing and self.training and not output_attentions:
+                def mlp_forward(
+                    completed_blocks_arg: torch.Tensor,
+                    partial_block_arg: torch.Tensor,
+                    decoder_layer_arg: ShoujenDecoderLayer = decoder_layer,
+                ) -> torch.Tensor:
+                    mlp_input = decoder_layer_arg.mlp_res(completed_blocks_arg, partial_block_arg)
+                    return partial_block_arg + decoder_layer_arg.apply_mlp(mlp_input)
+
+                partial_block = self._gradient_checkpointing_func(
+                    mlp_forward,
+                    completed_blocks,
+                    partial_block,
+                )
+            else:
+                mlp_input = decoder_layer.mlp_res(completed_blocks, partial_block)
+                partial_block = partial_block + decoder_layer.apply_mlp(mlp_input)
 
             hidden_states = partial_block
             new_attn_caches.append(new_attn_cache if use_cache else None)
@@ -792,29 +642,17 @@ class ShoujenForCausalLM(ShoujenPreTrainedModel, GenerationMixin):
     def set_input_embeddings(self, value: nn.Embedding) -> None:
         self.model.embed_tokens = value
 
+    def set_track_max_qk_logit(self, enabled: bool) -> None:
+        self.model.set_track_max_qk_logit(enabled)
+
+    def max_qk_logit(self) -> float | None:
+        return self.model.max_qk_logit()
+
     def get_output_embeddings(self) -> nn.Linear:
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings: nn.Linear) -> None:
         self.lm_head = new_embeddings
-
-    def get_per_layer_input_embeddings(self) -> nn.Embedding | None:
-        return self.model.get_per_layer_input_embeddings()
-
-    def set_per_layer_input_embeddings(self, value: nn.Embedding) -> None:
-        self.model.set_per_layer_input_embeddings(value)
-        self.config.vocab_size_per_layer_input = value.num_embeddings
-
-    def resize_token_embeddings(
-        self,
-        new_num_tokens: int | None = None,
-        pad_to_multiple_of: int | None = None,
-        mean_resizing: bool = True,
-    ) -> nn.Embedding:
-        model_embeds = super().resize_token_embeddings(new_num_tokens, pad_to_multiple_of, mean_resizing)
-        self.model._resize_per_layer_input_embeddings(model_embeds.num_embeddings, mean_resizing=mean_resizing)
-        self.config.vocab_size_per_layer_input = self.model.config.vocab_size_per_layer_input
-        return model_embeds
 
     def prepare_inputs_for_generation(
         self,
@@ -915,8 +753,23 @@ class ShoujenForCausalLM(ShoujenPreTrainedModel, GenerationMixin):
             v_first=outputs.v_first,
         )
 
-    def num_parameters(self, only_trainable: bool = False) -> int:
-        return sum(p.numel() for p in self.parameters() if (not only_trainable) or p.requires_grad)
+    def num_parameters(self, only_trainable: bool = False, exclude_embeddings: bool = False) -> int:
+        total = 0
+        input_embeddings = self.get_input_embeddings()
+        output_embeddings = self.get_output_embeddings()
+        excluded = set()
+        if exclude_embeddings:
+            if input_embeddings is not None:
+                excluded.add(id(input_embeddings.weight))
+            if output_embeddings is not None:
+                excluded.add(id(output_embeddings.weight))
+        for p in self.parameters():
+            if only_trainable and not p.requires_grad:
+                continue
+            if id(p) in excluded:
+                continue
+            total += p.numel()
+        return total
 
 
 ShoujenLM = ShoujenForCausalLM

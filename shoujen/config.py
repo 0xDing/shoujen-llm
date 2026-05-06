@@ -33,11 +33,10 @@ class ShoujenConfig(PretrainedConfig):
         head_dim: int = 64,
         rope_theta: float = 10000.0,
         attention_dropout: float = 0.0,
+        qk_norm: bool = False,
+        qk_norm_eps: float | None = None,
         intermediate_size: int = 2048,
         hidden_act: str = "silu",
-        ple_dim: int = 24,
-        hidden_size_per_layer_input: int | None = None,
-        vocab_size_per_layer_input: int | None = None,
         attnres_n_blocks: int = 4,
         attnres_block_size: int | None = None,
         rms_norm_eps: float = 1e-6,
@@ -60,10 +59,6 @@ class ShoujenConfig(PretrainedConfig):
             num_kv_heads = num_key_value_heads
         if max_position_embeddings is None:
             max_position_embeddings = max_seq_len
-        if hidden_size_per_layer_input is None:
-            hidden_size_per_layer_input = ple_dim
-        if vocab_size_per_layer_input is None:
-            vocab_size_per_layer_input = vocab_size
         if attnres_block_size is None:
             attnres_block_size = attnres_n_blocks
 
@@ -103,13 +98,11 @@ class ShoujenConfig(PretrainedConfig):
         self.head_dim = head_dim
         self.rope_theta = rope_theta
         self.attention_dropout = attention_dropout
+        self.qk_norm = qk_norm
+        self.qk_norm_eps = rms_norm_eps if qk_norm_eps is None else qk_norm_eps
 
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
-
-        self.ple_dim = ple_dim
-        self.hidden_size_per_layer_input = hidden_size_per_layer_input
-        self.vocab_size_per_layer_input = vocab_size_per_layer_input
 
         self.attnres_n_blocks = attnres_n_blocks
         self.attnres_block_size = attnres_block_size

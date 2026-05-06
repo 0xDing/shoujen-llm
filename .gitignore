@@ -11,5 +11,5 @@ wheels/
 
 data/*
 !data/vocab.json
-runs/*
-.pytest_cache/
+runs
+.pytest_cache
