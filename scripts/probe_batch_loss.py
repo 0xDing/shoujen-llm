@@ -136,16 +136,36 @@ def clear_device_cache() -> None:
         torch.mps.empty_cache()
         torch.mps.synchronize()
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
 
-def mps_memory() -> dict[str, int | None]:
-    if not hasattr(torch, "mps") or not torch.backends.mps.is_available():
-        return {"current_allocated": None, "driver_allocated": None, "recommended_max": None}
+def device_memory(device: torch.device) -> dict[str, int | None]:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+        props = torch.cuda.get_device_properties(device)
+        return {
+            "current_allocated": int(torch.cuda.memory_allocated(device)),
+            "driver_allocated": int(torch.cuda.memory_reserved(device)),
+            "max_current_allocated": int(torch.cuda.max_memory_allocated(device)),
+            "max_driver_allocated": int(torch.cuda.max_memory_reserved(device)),
+            "recommended_max": int(props.total_memory),
+        }
+
+    if not hasattr(torch, "mps") or not torch.backends.mps.is_available() or device.type != "mps":
+        return {
+            "current_allocated": None,
+            "driver_allocated": None,
+            "max_current_allocated": None,
+            "max_driver_allocated": None,
+            "recommended_max": None,
+        }
     torch.mps.synchronize()
     return {
         "current_allocated": int(torch.mps.current_allocated_memory()),
         "driver_allocated": int(torch.mps.driver_allocated_memory()),
+        "max_current_allocated": None,
+        "max_driver_allocated": None,
         "recommended_max": int(torch.mps.recommended_max_memory()),
     }
 
@@ -202,6 +222,8 @@ def run_candidate(
     amp_dtype: torch.dtype | None,
 ) -> dict[str, Any]:
     clear_device_cache()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     torch.manual_seed(args.seed)
 
     train_args = train_args_for_candidate(args, candidate)
@@ -326,9 +348,17 @@ def run_candidate(
 
         if device.type == "mps":
             torch.mps.synchronize()
-        mem = mps_memory()
-        max_current = max(max_current, int(mem["current_allocated"] or 0))
-        max_driver = max(max_driver, int(mem["driver_allocated"] or 0))
+        mem = device_memory(device)
+        max_current = max(
+            max_current,
+            int(mem["current_allocated"] or 0),
+            int(mem["max_current_allocated"] or 0),
+        )
+        max_driver = max(
+            max_driver,
+            int(mem["driver_allocated"] or 0),
+            int(mem["max_driver_allocated"] or 0),
+        )
 
         optimizer_steps += 1
         active_tokens_seen += step_active_tokens
@@ -346,6 +376,9 @@ def run_candidate(
     )
     if device.type == "mps":
         torch.mps.synchronize()
+    final_mem = device_memory(device)
+    max_current = max(max_current, int(final_mem["max_current_allocated"] or 0))
+    max_driver = max(max_driver, int(final_mem["max_driver_allocated"] or 0))
 
     train_loss_mean = sum(train_losses) / max(1, len(train_losses))
     train_loss_final = train_losses[-1] if train_losses else None
@@ -375,7 +408,7 @@ def run_candidate(
         "memory": {
             "max_current_allocated": max_current,
             "max_driver_allocated": max_driver,
-            "recommended_max": mps_memory()["recommended_max"],
+            "recommended_max": final_mem["recommended_max"],
         },
         "failure": None,
     }
@@ -416,6 +449,7 @@ def main() -> None:
             )
         except RuntimeError as exc:
             clear_device_cache()
+            mem = device_memory(device)
             result = {
                 "candidate": candidate.label,
                 "batch_size": candidate.batch_size,
@@ -424,7 +458,7 @@ def main() -> None:
                 "gradient_checkpointing": candidate.gradient_checkpointing,
                 "ok": False,
                 "failure": str(exc),
-                "memory": mps_memory(),
+                "memory": mem,
             }
         results.append(result)
         if result["ok"]:
