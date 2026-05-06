@@ -186,6 +186,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-clips", type=parse_float_list, default=parse_float_list("0.5,1.0,2.0"))
     p.add_argument("--z-loss-weights", type=parse_float_list, default=parse_float_list("0,1e-5,1e-4,3e-4"))
     p.add_argument("--adamw-wd-choices", type=parse_float_list, default=parse_float_list("0.01,0.05,0.1,0.2"))
+    p.add_argument("--adamw-independent-wd-choices", type=parse_bool_list, default=parse_bool_list("true"))
     p.add_argument("--adamw-embed-wd-choices", type=parse_float_list, default=parse_float_list("0,0.01,0.05"))
     p.add_argument("--muon-wd-choices", type=parse_float_list, default=parse_float_list("0,0.01"))
     p.add_argument("--lr-schedules", type=parse_str_list, default=parse_str_list("cosine,wsd"))
@@ -285,6 +286,10 @@ def suggest_hparams(trial: Any, args: argparse.Namespace) -> dict[str, Any]:
         "muon_adaptive": trial.suggest_categorical("muon_adaptive", args.muon_adaptive_choices),
         "muon_wd": trial.suggest_categorical("muon_wd", args.muon_wd_choices),
         "adamw_wd": trial.suggest_categorical("adamw_wd", args.adamw_wd_choices),
+        "adamw_independent_wd": trial.suggest_categorical(
+            "adamw_independent_wd",
+            args.adamw_independent_wd_choices,
+        ),
         "adamw_embed_wd": trial.suggest_categorical("adamw_embed_wd", args.adamw_embed_wd_choices),
         "adamw_foreach": trial.suggest_categorical("adamw_foreach", args.adamw_foreach_choices),
         "lr_schedule": trial.suggest_categorical("lr_schedule", args.lr_schedules),
@@ -344,7 +349,7 @@ def make_trial_train_args(
         adamw_lr=float(params["adamw_lr"]),
         muon_wd=float(params["muon_wd"]),
         adamw_wd=float(params["adamw_wd"]),
-        adamw_independent_wd=True,
+        adamw_independent_wd=bool(params["adamw_independent_wd"]),
         adamw_embed_wd=float(params["adamw_embed_wd"]),
         adamw_foreach=bool(params["adamw_foreach"]),
         lr_schedule=str(params["lr_schedule"]),
@@ -986,6 +991,8 @@ def build_formal_command(args: argparse.Namespace, params: dict[str, Any]) -> st
         cmd.append("--no-muon-adaptive")
     if params["adamw_foreach"]:
         cmd.append("--adamw-foreach")
+    if not params.get("adamw_independent_wd", True):
+        cmd.append("--no-adamw-independent-wd")
     if params["qk_norm"]:
         cmd.append("--qk-norm")
     if args.track_qk:
