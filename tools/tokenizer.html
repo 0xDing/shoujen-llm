@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shoujen Tokenizer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-slate-50 text-slate-950">
+  <main class="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-4 px-4 py-4 sm:px-6 lg:px-8">
+    <header class="flex flex-col gap-3 border-b border-slate-200 pb-4 lg:flex-row lg:items-center lg:justify-between">
+      <div>
+        <h1 class="text-2xl font-semibold tracking-normal">Shoujen Tokenizer</h1>
+        <p class="mt-1 text-sm text-slate-600">data/vocab.json</p>
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <span id="vocabStatus" class="inline-flex min-h-9 items-center rounded-lg border border-amber-300 bg-amber-50 px-3 text-sm font-medium text-amber-900">Loading vocab</span>
+        <label class="inline-flex min-h-9 cursor-pointer items-center rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-800 hover:bg-slate-100">
+          Load vocab
+          <input id="vocabFile" type="file" accept=".json,application/json" class="sr-only">
+        </label>
+      </div>
+    </header>
+
+    <section class="grid grid-cols-2 gap-3 sm:grid-cols-5">
+      <div class="rounded-lg border border-slate-200 bg-white p-3">
+        <div class="text-xs font-medium uppercase tracking-wide text-slate-500">Vocab</div>
+        <div id="vocabSize" class="mt-1 text-2xl font-semibold">0</div>
+      </div>
+      <div class="rounded-lg border border-slate-200 bg-white p-3">
+        <div class="text-xs font-medium uppercase tracking-wide text-slate-500">Chars</div>
+        <div id="charCount" class="mt-1 text-2xl font-semibold">0</div>
+      </div>
+      <div class="rounded-lg border border-slate-200 bg-white p-3">
+        <div class="text-xs font-medium uppercase tracking-wide text-slate-500">Tokens</div>
+        <div id="tokenCount" class="mt-1 text-2xl font-semibold">0</div>
+      </div>
+      <div class="rounded-lg border border-slate-200 bg-white p-3">
+        <div class="text-xs font-medium uppercase tracking-wide text-slate-500">Fallback</div>
+        <div id="fallbackCount" class="mt-1 text-2xl font-semibold">0</div>
+      </div>
+      <div class="rounded-lg border border-slate-200 bg-white p-3">
+        <div class="text-xs font-medium uppercase tracking-wide text-slate-500">Unique</div>
+        <div id="uniqueCount" class="mt-1 text-2xl font-semibold">0</div>
+      </div>
+    </section>
+
+    <section class="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-2">
+      <div class="flex min-h-[520px] flex-col rounded-lg border border-slate-200 bg-white">
+        <div class="flex min-h-12 items-center justify-between gap-3 border-b border-slate-200 px-3">
+          <div class="text-sm font-semibold">Text to IDs</div>
+          <div class="flex items-center gap-2">
+            <label class="inline-flex min-h-8 items-center gap-2 rounded-lg border border-slate-300 px-2 text-sm text-slate-700">
+              <input id="addEos" type="checkbox" class="h-4 w-4 rounded border-slate-300 text-teal-700 focus:ring-teal-700">
+              EOS
+            </label>
+            <button id="copyIds" class="min-h-8 rounded-lg bg-teal-700 px-3 text-sm font-medium text-white hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-slate-300">Copy IDs</button>
+          </div>
+        </div>
+        <div class="grid flex-1 grid-rows-2">
+          <label class="flex min-h-0 flex-col border-b border-slate-200">
+            <span class="px-3 py-2 text-xs font-medium uppercase tracking-wide text-slate-500">Input</span>
+            <textarea id="textInput" spellcheck="false" class="min-h-0 flex-1 resize-none border-0 px-3 pb-3 font-mono text-sm leading-6 outline-none ring-0 focus:ring-0" placeholder="Type text"></textarea>
+          </label>
+          <label class="flex min-h-0 flex-col">
+            <span class="px-3 py-2 text-xs font-medium uppercase tracking-wide text-slate-500">Token IDs</span>
+            <textarea id="idsOutput" readonly spellcheck="false" class="min-h-0 flex-1 resize-none border-0 bg-slate-50 px-3 pb-3 font-mono text-sm leading-6 text-slate-800 outline-none ring-0 focus:ring-0"></textarea>
+          </label>
+        </div>
+      </div>
+
+      <div class="flex min-h-[520px] flex-col rounded-lg border border-slate-200 bg-white">
+        <div class="flex min-h-12 items-center justify-between gap-3 border-b border-slate-200 px-3">
+          <div class="text-sm font-semibold">IDs to Text</div>
+          <div class="flex items-center gap-2">
+            <label class="inline-flex min-h-8 items-center gap-2 rounded-lg border border-slate-300 px-2 text-sm text-slate-700">
+              <input id="skipSpecial" type="checkbox" checked class="h-4 w-4 rounded border-slate-300 text-teal-700 focus:ring-teal-700">
+              Skip special
+            </label>
+            <button id="copyText" class="min-h-8 rounded-lg bg-slate-800 px-3 text-sm font-medium text-white hover:bg-slate-900 disabled:cursor-not-allowed disabled:bg-slate-300">Copy text</button>
+          </div>
+        </div>
+        <div class="grid flex-1 grid-rows-2">
+          <label class="flex min-h-0 flex-col border-b border-slate-200">
+            <span class="px-3 py-2 text-xs font-medium uppercase tracking-wide text-slate-500">Input IDs</span>
+            <textarea id="idsInput" spellcheck="false" class="min-h-0 flex-1 resize-none border-0 px-3 pb-3 font-mono text-sm leading-6 outline-none ring-0 focus:ring-0" placeholder="260 261 262"></textarea>
+          </label>
+          <label class="flex min-h-0 flex-col">
+            <span class="px-3 py-2 text-xs font-medium uppercase tracking-wide text-slate-500">Decoded text</span>
+            <textarea id="decodedOutput" readonly spellcheck="false" class="min-h-0 flex-1 resize-none border-0 bg-slate-50 px-3 pb-3 font-mono text-sm leading-6 text-slate-800 outline-none ring-0 focus:ring-0"></textarea>
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <section class="min-h-[260px] rounded-lg border border-slate-200 bg-white">
+      <div class="flex min-h-12 items-center justify-between gap-3 border-b border-slate-200 px-3">
+        <div class="text-sm font-semibold">Token detail</div>
+        <button id="clearAll" class="min-h-8 rounded-lg border border-slate-300 bg-white px-3 text-sm font-medium text-slate-800 hover:bg-slate-100">Clear</button>
+      </div>
+      <div class="overflow-auto">
+        <table class="w-full min-w-[760px] table-fixed text-left text-sm">
+          <thead class="bg-slate-100 text-xs uppercase tracking-wide text-slate-600">
+            <tr>
+              <th class="w-16 px-3 py-2 font-semibold">#</th>
+              <th class="w-24 px-3 py-2 font-semibold">ID</th>
+              <th class="w-32 px-3 py-2 font-semibold">Kind</th>
+              <th class="w-40 px-3 py-2 font-semibold">Token</th>
+              <th class="px-3 py-2 font-semibold">Code</th>
+            </tr>
+          </thead>
+          <tbody id="tokenRows" class="divide-y divide-slate-100"></tbody>
+        </table>
+      </div>
+      <div id="detailNote" class="border-t border-slate-200 px-3 py-2 text-sm text-slate-600">No tokens</div>
+    </section>
+  </main>
+
+  <script>
+    const SPECIAL_TOKENS = ["<pad>", "<eos>", "<im_start>", "<im_end>"];
+    const BYTE_OFFSET = SPECIAL_TOKENS.length;
+    const N_BYTES = 256;
+    const CHAR_OFFSET = BYTE_OFFSET + N_BYTES;
+    const DETAIL_LIMIT = 1200;
+
+    const els = {
+      vocabStatus: document.getElementById("vocabStatus"),
+      vocabFile: document.getElementById("vocabFile"),
+      vocabSize: document.getElementById("vocabSize"),
+      charCount: document.getElementById("charCount"),
+      tokenCount: document.getElementById("tokenCount"),
+      fallbackCount: document.getElementById("fallbackCount"),
+      uniqueCount: document.getElementById("uniqueCount"),
+      textInput: document.getElementById("textInput"),
+      idsOutput: document.getElementById("idsOutput"),
+      idsInput: document.getElementById("idsInput"),
+      decodedOutput: document.getElementById("decodedOutput"),
+      addEos: document.getElementById("addEos"),
+      skipSpecial: document.getElementById("skipSpecial"),
+      copyIds: document.getElementById("copyIds"),
+      copyText: document.getElementById("copyText"),
+      clearAll: document.getElementById("clearAll"),
+      tokenRows: document.getElementById("tokenRows"),
+      detailNote: document.getElementById("detailNote")
+    };
+
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+
+    let tokens = [];
+    let idOf = new Map();
+    let vocabReady = false;
+    let syncIdsInput = true;
+
+    function byteToken(value) {
+      return "<byte_" + value.toString(16).toUpperCase().padStart(2, "0") + ">";
+    }
+
+    function setStatus(text, state) {
+      els.vocabStatus.textContent = text;
+      els.vocabStatus.className = "inline-flex min-h-9 items-center rounded-lg border px-3 text-sm font-medium";
+      if (state === "ready") {
+        els.vocabStatus.className += " border-teal-300 bg-teal-50 text-teal-900";
+      } else if (state === "error") {
+        els.vocabStatus.className += " border-red-300 bg-red-50 text-red-900";
+      } else {
+        els.vocabStatus.className += " border-amber-300 bg-amber-50 text-amber-900";
+      }
+    }
+
+    function validateVocab(nextTokens) {
+      if (!Array.isArray(nextTokens)) {
+        throw new Error("vocab must be a JSON array");
+      }
+      for (let i = 0; i < SPECIAL_TOKENS.length; i += 1) {
+        if (nextTokens[i] !== SPECIAL_TOKENS[i]) {
+          throw new Error("special token mismatch at id " + i);
+        }
+      }
+      for (let i = 0; i < N_BYTES; i += 1) {
+        const id = BYTE_OFFSET + i;
+        if (nextTokens[id] !== byteToken(i)) {
+          throw new Error("byte token mismatch at id " + id);
+        }
+      }
+    }
+
+    function loadVocab(nextTokens, source) {
+      validateVocab(nextTokens);
+      tokens = nextTokens;
+      idOf = new Map(tokens.map((token, id) => [token, id]));
+      vocabReady = true;
+      els.vocabSize.textContent = tokens.length.toLocaleString();
+      setStatus("Loaded " + source, "ready");
+      updateEncode();
+      updateDecode();
+    }
+
+    async function autoLoadVocab() {
+      try {
+        const response = await fetch("../data/vocab.json", { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status);
+        }
+        loadVocab(await response.json(), "../data/vocab.json");
+      } catch (error) {
+        vocabReady = false;
+        setStatus("Select data/vocab.json", "warn");
+      }
+    }
+
+    function encodeText(text, addEos) {
+      const ids = [];
+      let fallbackBytes = 0;
+      for (const ch of text) {
+        const id = idOf.get(ch);
+        if (id !== undefined) {
+          ids.push(id);
+        } else {
+          const bytes = encoder.encode(ch);
+          fallbackBytes += bytes.length;
+          for (const value of bytes) {
+            ids.push(BYTE_OFFSET + value);
+          }
+        }
+      }
+      if (addEos) {
+        ids.push(1);
+      }
+      return { ids, fallbackBytes };
+    }
+
+    function byteTokenValue(token) {
+      return Number.parseInt(token.slice(6, 8), 16);
+    }
+
+    function flushBytes(byteBuffer, out) {
+      if (byteBuffer.length > 0) {
+        out.push(decoder.decode(new Uint8Array(byteBuffer)));
+        byteBuffer.length = 0;
+      }
+    }
+
+    function decodeIds(ids, skipSpecial) {
+      const out = [];
+      const byteBuffer = [];
+      let invalidCount = 0;
+      for (const id of ids) {
+        if (id < 0 || id >= tokens.length) {
+          flushBytes(byteBuffer, out);
+          invalidCount += 1;
+          continue;
+        }
+        const token = tokens[id];
+        if (id < BYTE_OFFSET) {
+          flushBytes(byteBuffer, out);
+          if (!skipSpecial) {
+            out.push(token);
+          }
+          continue;
+        }
+        if (id < CHAR_OFFSET) {
+          byteBuffer.push(byteTokenValue(token));
+          continue;
+        }
+        flushBytes(byteBuffer, out);
+        out.push(token);
+      }
+      flushBytes(byteBuffer, out);
+      return { text: out.join(""), invalidCount };
+    }
+
+    function parseIds(value) {
+      const matches = value.match(/-?\d+/g);
+      if (!matches) {
+        return [];
+      }
+      return matches.map(Number).filter(Number.isSafeInteger);
+    }
+
+    function escapeToken(token) {
+      if (token === "\n") return "\\n";
+      if (token === "\t") return "\\t";
+      if (token === " ") return "space";
+      return token;
+    }
+
+    function tokenKind(id) {
+      if (id < 0 || id >= tokens.length) return "invalid";
+      if (id < BYTE_OFFSET) return "special";
+      if (id < CHAR_OFFSET) return "byte";
+      return "char";
+    }
+
+    function tokenCode(id) {
+      if (id < 0 || id >= tokens.length) return "";
+      if (id < BYTE_OFFSET) return tokens[id];
+      if (id < CHAR_OFFSET) return "0x" + byteTokenValue(tokens[id]).toString(16).toUpperCase().padStart(2, "0");
+      const chars = Array.from(tokens[id]);
+      return chars.map((ch) => {
+        return "U+" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0");
+      }).join(" ");
+    }
+
+    function renderDetail(ids) {
+      const visible = ids.slice(0, DETAIL_LIMIT);
+      const rows = visible.map((id, index) => {
+        const valid = id >= 0 && id < tokens.length;
+        const token = valid ? escapeToken(tokens[id]) : "";
+        const kind = tokenKind(id);
+        const kindClass = kind === "char" ? "text-teal-800" : kind === "byte" ? "text-amber-800" : kind === "special" ? "text-indigo-800" : "text-red-800";
+        return [
+          "<tr>",
+          "<td class=\"px-3 py-2 font-mono text-slate-500\">" + index + "</td>",
+          "<td class=\"px-3 py-2 font-mono\">" + id + "</td>",
+          "<td class=\"px-3 py-2 font-medium " + kindClass + "\">" + kind + "</td>",
+          "<td class=\"break-all px-3 py-2 font-mono\">" + escapeHtml(token) + "</td>",
+          "<td class=\"break-all px-3 py-2 font-mono text-slate-700\">" + escapeHtml(tokenCode(id)) + "</td>",
+          "</tr>"
+        ].join("");
+      }).join("");
+      els.tokenRows.innerHTML = rows;
+      if (ids.length === 0) {
+        els.detailNote.textContent = "No tokens";
+      } else if (ids.length > DETAIL_LIMIT) {
+        els.detailNote.textContent = "Showing " + DETAIL_LIMIT.toLocaleString() + " of " + ids.length.toLocaleString() + " tokens";
+      } else {
+        els.detailNote.textContent = ids.length.toLocaleString() + " tokens";
+      }
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll("\"", "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function updateEncode() {
+      if (!vocabReady) {
+        els.idsOutput.value = "";
+        els.charCount.textContent = Array.from(els.textInput.value).length.toLocaleString();
+        els.tokenCount.textContent = "0";
+        els.fallbackCount.textContent = "0";
+        els.uniqueCount.textContent = "0";
+        renderDetail([]);
+        return;
+      }
+      const result = encodeText(els.textInput.value, els.addEos.checked);
+      const idsText = result.ids.join(" ");
+      els.idsOutput.value = idsText;
+      if (syncIdsInput) {
+        els.idsInput.value = idsText;
+        updateDecode();
+      }
+      els.charCount.textContent = Array.from(els.textInput.value).length.toLocaleString();
+      els.tokenCount.textContent = result.ids.length.toLocaleString();
+      els.fallbackCount.textContent = result.fallbackBytes.toLocaleString();
+      els.uniqueCount.textContent = new Set(result.ids).size.toLocaleString();
+      renderDetail(result.ids);
+    }
+
+    function updateDecode() {
+      if (!vocabReady) {
+        els.decodedOutput.value = "";
+        return;
+      }
+      const ids = parseIds(els.idsInput.value);
+      const result = decodeIds(ids, els.skipSpecial.checked);
+      els.decodedOutput.value = result.text;
+      if (!syncIdsInput) {
+        els.charCount.textContent = Array.from(result.text).length.toLocaleString();
+        els.tokenCount.textContent = ids.length.toLocaleString();
+        els.fallbackCount.textContent = ids.filter((id) => id >= BYTE_OFFSET && id < CHAR_OFFSET).length.toLocaleString();
+        els.uniqueCount.textContent = new Set(ids).size.toLocaleString();
+        renderDetail(ids);
+      }
+    }
+
+    async function copyValue(element) {
+      const value = element.value;
+      if (!value) return;
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(value);
+        return;
+      }
+      element.focus();
+      element.select();
+      document.execCommand("copy");
+    }
+
+    els.vocabFile.addEventListener("change", async () => {
+      const file = els.vocabFile.files[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        loadVocab(JSON.parse(text), file.name);
+      } catch (error) {
+        setStatus(error.message || "Failed to load vocab", "error");
+      }
+    });
+
+    els.textInput.addEventListener("input", () => {
+      syncIdsInput = true;
+      updateEncode();
+    });
+    els.addEos.addEventListener("change", updateEncode);
+    els.idsInput.addEventListener("input", () => {
+      syncIdsInput = false;
+      updateDecode();
+    });
+    els.skipSpecial.addEventListener("change", updateDecode);
+    els.copyIds.addEventListener("click", () => copyValue(els.idsOutput));
+    els.copyText.addEventListener("click", () => copyValue(els.decodedOutput));
+    els.clearAll.addEventListener("click", () => {
+      els.textInput.value = "";
+      els.idsInput.value = "";
+      els.decodedOutput.value = "";
+      syncIdsInput = true;
+      updateEncode();
+    });
+
+    autoLoadVocab();
+  </script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk '/kept/ {print NR\": \"$0}')",
+      "Bash(awk 'NR>=1 && NR<=12')"
+    ]
+  }
+}
