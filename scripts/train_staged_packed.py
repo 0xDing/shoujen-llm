@@ -65,7 +65,8 @@ def parse_args():
     p.add_argument("--init-ckpt", help="Resume / initialize from a checkpoint")
     p.add_argument("--config", help="JSON file overriding default model config")
 
-    p.add_argument("--batch-size", type=int, default=4, help="Packed sequences per optimizer step")
+    p.add_argument("--batch-size", type=int, default=4, help="Packed sequences per micro-batch")
+    p.add_argument("--gradient-accumulation-steps", type=int, default=1)
     p.add_argument("--block-size", type=int, default=2048)
     p.add_argument("--max-steps", type=int, default=0, help="Global cap; 0 means no cap")
     p.add_argument("--max-steps-per-stage", type=int, default=0, help="Per-stage cap; 0 means full shard")
@@ -345,6 +346,8 @@ def save_training_checkpoint(
 
 def main():
     args = parse_args()
+    if args.gradient_accumulation_steps <= 0:
+        raise SystemExit("--gradient-accumulation-steps must be positive")
     torch.manual_seed(args.seed)
 
     out_dir = Path(args.output)
@@ -424,6 +427,13 @@ def main():
         )
 
         stage_step = 0
+        accum_count = 0
+        last_lm_loss = None
+        last_total_loss = None
+        last_z_loss = None
+        last_active_tokens = None
+        muon.zero_grad(set_to_none=True)
+        adamw.zero_grad(set_to_none=True)
         for batch in loader:
             if args.max_steps and global_step >= args.max_steps:
                 stop_training = True
@@ -437,9 +447,10 @@ def main():
                 vocab_size=tokenizer.vocab_size,
                 block_size=args.block_size,
             )
-            mult = lr_multiplier(args, global_step, schedule_steps)
-            set_optimizer_lr(muon, base_muon_lrs, mult)
-            set_optimizer_lr(adamw, base_adamw_lrs, mult)
+            if accum_count == 0:
+                mult = lr_multiplier(args, global_step, schedule_steps)
+                set_optimizer_lr(muon, base_muon_lrs, mult)
+                set_optimizer_lr(adamw, base_adamw_lrs, mult)
 
             with make_autocast(device, amp_dtype):
                 outputs = model(
@@ -466,26 +477,36 @@ def main():
                     )
                     total_loss = total_loss + args.z_loss_weight * z_loss
 
-            muon.zero_grad(set_to_none=True)
-            adamw.zero_grad(set_to_none=True)
-            total_loss.backward()
+            (total_loss / args.gradient_accumulation_steps).backward()
+            accum_count += 1
+            last_lm_loss = lm_loss
+            last_total_loss = total_loss
+            last_z_loss = z_loss
+            last_active_tokens = active_tokens
+            last_log_tokens += int(batch["input_ids"].numel())
+
+            if accum_count < args.gradient_accumulation_steps:
+                continue
+
             if args.grad_clip > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 if not torch.isfinite(grad_norm):
                     raise RuntimeError(f"Non-finite gradient norm at step {global_step + 1}: {grad_norm.item()}")
             muon.step()
             adamw.step()
+            muon.zero_grad(set_to_none=True)
+            adamw.zero_grad(set_to_none=True)
+            accum_count = 0
 
             global_step += 1
             stage_step += 1
-            last_log_tokens += int(batch["input_ids"].numel())
 
             if args.log_every and global_step % args.log_every == 0:
                 dt = time.time() - last_log_t
                 tok_per_sec = last_log_tokens / max(dt, 1e-6)
                 extras = ""
-                if args.z_loss_weight and z_loss is not None:
-                    extras += f" z={z_loss.item():.4f} total={total_loss.item():.4f}"
+                if args.z_loss_weight and last_z_loss is not None and last_total_loss is not None:
+                    extras += f" z={last_z_loss.item():.4f} total={last_total_loss.item():.4f}"
                 max_qk = None
                 if args.log_max_qk_logit:
                     max_qk = model.max_qk_logit()
@@ -493,20 +514,20 @@ def main():
                         extras += f" max_qk={max_qk:.2f}"
                 print(
                     f"stage={stage_name} step={global_step} stage_step={stage_step} "
-                    f"lm={lm_loss.item():.4f}{extras} lr_mult={mult:.3f} tok/s={tok_per_sec:.0f}",
+                    f"lm={last_lm_loss.item():.4f}{extras} lr_mult={mult:.3f} tok/s={tok_per_sec:.0f}",
                     flush=True,
                 )
                 wandb_payload = {
-                    "train/lm_loss": float(lm_loss.item()),
-                    "train/active_tokens": float(active_tokens.item()),
+                    "train/lm_loss": float(last_lm_loss.item()),
+                    "train/active_tokens": float(last_active_tokens.item()) if last_active_tokens is not None else 0.0,
                     "train/lr_multiplier": mult,
                     "train/tok_per_sec": tok_per_sec,
                     "stage/index": stage_idx,
                     "stage/step": stage_step,
                 }
-                if z_loss is not None:
-                    wandb_payload["train/z_loss"] = float(z_loss.item())
-                    wandb_payload["train/total_loss"] = float(total_loss.item())
+                if last_z_loss is not None and last_total_loss is not None:
+                    wandb_payload["train/z_loss"] = float(last_z_loss.item())
+                    wandb_payload["train/total_loss"] = float(last_total_loss.item())
                 if max_qk is not None:
                     wandb_payload["train/max_qk_logit"] = max_qk
                 log_wandb(

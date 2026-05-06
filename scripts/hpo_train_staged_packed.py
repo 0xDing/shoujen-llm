@@ -181,6 +181,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stability-weight", type=float, default=0.20)
 
     p.add_argument("--batch-sizes", type=parse_int_list, default=parse_int_list("2,4,8"))
+    p.add_argument("--gradient-accumulation-steps", type=parse_int_list, default=parse_int_list("1"))
     p.add_argument("--block-sizes", type=parse_int_list, default=parse_int_list("1024,1536,2048"))
     p.add_argument("--muon-ns-steps", type=parse_int_list, default=parse_int_list("3,5,7"))
     p.add_argument("--grad-clips", type=parse_float_list, default=parse_float_list("0.5,1.0,2.0"))
@@ -225,6 +226,8 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("--eval-every must be positive")
     if args.seeds_per_trial <= 0:
         raise SystemExit("--seeds-per-trial must be positive")
+    if any(value <= 0 for value in args.gradient_accumulation_steps):
+        raise SystemExit("--gradient-accumulation-steps values must be positive")
     if not set(args.lr_schedules).issubset({"cosine", "wsd"}):
         raise SystemExit("--lr-schedules may contain only cosine,wsd")
     if not set(args.amp_choices).issubset({"auto", "none"}):
@@ -278,6 +281,10 @@ def load_optuna():
 def suggest_hparams(trial: Any, args: argparse.Namespace) -> dict[str, Any]:
     params = {
         "batch_size": trial.suggest_categorical("batch_size", args.batch_sizes),
+        "gradient_accumulation_steps": trial.suggest_categorical(
+            "gradient_accumulation_steps",
+            args.gradient_accumulation_steps,
+        ),
         "block_size": trial.suggest_categorical("block_size", args.block_sizes),
         "amp": "none" if args.no_amp else trial.suggest_categorical("amp", args.amp_choices),
         "muon_lr": trial.suggest_float("muon_lr", args.muon_lr_min, args.muon_lr_max, log=True),
@@ -331,6 +338,7 @@ def make_trial_train_args(
         init_ckpt=search_args.init_ckpt,
         config=search_args.config,
         batch_size=int(params["batch_size"]),
+        gradient_accumulation_steps=int(params["gradient_accumulation_steps"]),
         block_size=int(params["block_size"]),
         max_steps=int(search_args.trial_steps),
         max_steps_per_stage=0,
@@ -566,6 +574,10 @@ def run_one_seed(
                 drop_last=True,
             )
             stage_step = 0
+            accum_count = 0
+            step_train_losses: list[float] = []
+            muon.zero_grad(set_to_none=True)
+            adamw.zero_grad(set_to_none=True)
             for batch in loader:
                 if global_step >= search_args.trial_steps:
                     stop_training = True
@@ -579,9 +591,11 @@ def run_one_seed(
                     vocab_size=tokenizer.vocab_size,
                     block_size=train_args.block_size,
                 )
-                mult = lr_multiplier(train_args, global_step, schedule_steps)
-                set_optimizer_lr(muon, base_muon_lrs, mult)
-                set_optimizer_lr(adamw, base_adamw_lrs, mult)
+                if accum_count == 0:
+                    mult = lr_multiplier(train_args, global_step, schedule_steps)
+                    set_optimizer_lr(muon, base_muon_lrs, mult)
+                    set_optimizer_lr(adamw, base_adamw_lrs, mult)
+                    step_train_losses = []
 
                 with torch.autocast(
                     device_type=device.type,
@@ -614,9 +628,20 @@ def run_one_seed(
                 total_loss_value = float(total_loss.detach().float().item())
                 checked_loss(total_loss_value, "training")
 
-                muon.zero_grad(set_to_none=True)
-                adamw.zero_grad(set_to_none=True)
-                total_loss.backward()
+                (total_loss / train_args.gradient_accumulation_steps).backward()
+                accum_count += 1
+                step_train_losses.append(float(lm_loss.detach().float().item()))
+                batch_tokens = int(batch["input_ids"].numel())
+                tokens_seen += batch_tokens
+                last_log_tokens += batch_tokens
+
+                current_qk = model.max_qk_logit() if train_args.log_max_qk_logit else None
+                if current_qk is not None:
+                    max_qk_logit = current_qk if max_qk_logit is None else max(max_qk_logit, current_qk)
+
+                if accum_count < train_args.gradient_accumulation_steps:
+                    continue
+
                 if train_args.grad_clip > 0:
                     grad_norm_t = torch.nn.utils.clip_grad_norm_(
                         model.parameters(),
@@ -630,16 +655,14 @@ def run_one_seed(
                         clip_count += 1
                 muon.step()
                 adamw.step()
+                muon.zero_grad(set_to_none=True)
+                adamw.zero_grad(set_to_none=True)
+                accum_count = 0
 
                 global_step += 1
                 stage_step += 1
-                batch_tokens = int(batch["input_ids"].numel())
-                tokens_seen += batch_tokens
-                last_log_tokens += batch_tokens
-                train_losses.append(float(lm_loss.detach().float().item()))
-                current_qk = model.max_qk_logit() if train_args.log_max_qk_logit else None
-                if current_qk is not None:
-                    max_qk_logit = current_qk if max_qk_logit is None else max(max_qk_logit, current_qk)
+                train_loss_value = sum(step_train_losses) / max(1, len(step_train_losses))
+                train_losses.append(train_loss_value)
 
                 should_log = train_args.log_every and global_step % train_args.log_every == 0
                 if should_log:
@@ -647,7 +670,7 @@ def run_one_seed(
                     local_tps = last_log_tokens / max(now - last_log_t, 1e-6)
                     print(
                         f"trial={trial_number} seed={seed} step={global_step} "
-                        f"stage={stage_path.stem} lm={lm_loss.item():.4f} "
+                        f"stage={stage_path.stem} lm={train_loss_value:.4f} "
                         f"lr_mult={mult:.3f} tok/s={local_tps:.0f}",
                         flush=True,
                     )
@@ -930,6 +953,8 @@ def build_formal_command(args: argparse.Namespace, params: dict[str, Any]) -> st
         str(args.formal_output),
         "--batch-size",
         str(int(params["batch_size"])),
+        "--gradient-accumulation-steps",
+        str(int(params["gradient_accumulation_steps"])),
         "--block-size",
         str(int(params["block_size"])),
         "--lr-schedule-steps",
