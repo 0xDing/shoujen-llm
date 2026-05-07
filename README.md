@@ -66,8 +66,11 @@ Text-only causal LM. Architecturally close to Qwen3.5, but with [RWKV7](https://
 - FFN = SwiGLU, `intermediate_size = 2048`
 - norm = RMSNorm
 - residual = Block Attention Residuals, `attnres_n_blocks = 4`
+- Per-Layer Embeddings (Gemma4-style PLE), `hidden_size_per_layer_input = 256`
 - token embedding and LM head tied
 - `max_seq_len = 2048`
+- default tokenizer vocab = 47,871
+- parameters = 114.1M effective, 432.7M with embeddings
 
 ### Model design trade-offs
 
@@ -76,13 +79,16 @@ Text-only causal LM. Architecturally close to Qwen3.5, but with [RWKV7](https://
 - *Why RWKV7 specifically?* It supports a state-passing recurrence that converts cleanly to a closed-form parallel scan during training — so we get O(T) inference and parallel training without the engineering cost of writing a custom Triton kernel from scratch.
 
 **24 layers at hidden 512 instead of e.g. 12 × 1024.**
-- For a fixed parameter budget, deeper-and-narrower wins on language modeling perplexity in this size class (≤100M), and the FFN cost (which dominates with `intermediate_size=2048`) scales with `hidden_size`, so going narrow keeps the per-step cost manageable on MPS. The downside is more sequential layers, i.e. less parallelism per token — acceptable for a single-GPU toy run.
+- For a fixed parameter budget, deeper-and-narrower wins on language modeling perplexity in this effective size class (~100M), and the FFN cost (which dominates with `intermediate_size=2048`) scales with `hidden_size`, so going narrow keeps the per-step cost manageable on MPS. The downside is more sequential layers, i.e. less parallelism per token — acceptable for a single-GPU toy run.
 
 **GQA (10 query heads, 2 KV heads).**
 - 5:1 GQA cuts the KV cache by 5× at inference for a ~negligible quality hit at this scale. Critical because the attention layers are the only place we pay sequence-length-quadratic memory; shrinking KV is the single largest knob for context-window headroom on the M1.
 
 **Block Attention Residuals (Moonshot-style).**
 - Standard pre-norm transformers exhibit "residual stream takeover" at depth — later layers struggle to overwrite low-frequency directions deposited early. Block residuals every 4 layers act as a periodic refresh that lets later attention blocks read a less-saturated stream. Cheap to add, measurably helps with deep-and-narrow shapes.
+
+**Gemma4-style Per-Layer Embeddings (PLE).**
+- The PLE table is packed as `vocab_size × num_hidden_layers × hidden_size_per_layer_input`. With the default 47,871-token CJK tokenizer and `24 × 256` per-token PLE slots, this adds 294.1M lookup parameters. Following Gemma's parameter-count convention, the effective count excludes embedding lookup tables, while the "with embeddings" count includes the tied token embedding and PLE table.
 
 **Tied embeddings + RMSNorm + RoPE.**
 - Standard small-model defaults; RoPE because the attention layers need positional information that RWKV layers can't supply implicitly across the full window.

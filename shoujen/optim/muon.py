@@ -168,7 +168,11 @@ def _is_rwkv_w0(name: str) -> bool:
 
 
 def _is_embedding_param(name: str) -> bool:
-    return name in {"model.embed_tokens.weight", "lm_head.weight"}
+    return name in {
+        "model.embed_tokens.weight",
+        "model.embed_tokens_per_layer.weight",
+        "lm_head.weight",
+    }
 
 
 def _is_adamw_no_decay(name: str, param: nn.Parameter) -> bool:

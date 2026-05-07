@@ -38,6 +38,8 @@ class ShoujenConfig(PretrainedConfig):
         qk_norm_eps: float | None = None,
         intermediate_size: int = 2048,
         hidden_act: str = "silu",
+        hidden_size_per_layer_input: int = 256,
+        vocab_size_per_layer_input: int | None = None,
         attnres_n_blocks: int = 4,
         attnres_block_size: int | None = None,
         rms_norm_eps: float = 1e-6,
@@ -60,6 +62,8 @@ class ShoujenConfig(PretrainedConfig):
             num_kv_heads = num_key_value_heads
         if max_position_embeddings is None:
             max_position_embeddings = max_seq_len
+        if vocab_size_per_layer_input is None:
+            vocab_size_per_layer_input = vocab_size
         if attnres_block_size is None:
             attnres_block_size = attnres_n_blocks
 
@@ -106,6 +110,9 @@ class ShoujenConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
 
+        self.hidden_size_per_layer_input = hidden_size_per_layer_input
+        self.vocab_size_per_layer_input = vocab_size_per_layer_input
+
         self.attnres_n_blocks = attnres_n_blocks
         self.attnres_block_size = attnres_block_size
 
@@ -146,6 +153,10 @@ class ShoujenConfig(PretrainedConfig):
             raise ValueError("attnres_block_size must be positive")
         if self.attention_window is not None and self.attention_window <= 0:
             raise ValueError("attention_window must be positive when set")
+        if self.hidden_size_per_layer_input < 0:
+            raise ValueError("hidden_size_per_layer_input must be non-negative")
+        if self.hidden_size_per_layer_input and self.vocab_size_per_layer_input <= 0:
+            raise ValueError("vocab_size_per_layer_input must be positive when PLE is enabled")
 
     @property
     def num_rwkv_heads(self) -> int:

@@ -27,6 +27,7 @@ def _tiny_config(num_layers: int = 4, hidden_size: int = 16) -> ShoujenConfig:
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         intermediate_size=hidden_size * 2,
+        hidden_size_per_layer_input=0,
         attnres_block_size=2,
         max_seq_len=16,
         max_position_embeddings=16,

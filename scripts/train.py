@@ -126,6 +126,8 @@ def build_config(args, tokenizer: ShoujenTokenizer) -> ShoujenConfig:
     else:
         cfg = ShoujenConfig()
     cfg.vocab_size = tokenizer.vocab_size
+    if cfg.hidden_size_per_layer_input:
+        cfg.vocab_size_per_layer_input = tokenizer.vocab_size
     cfg.pad_token_id = tokenizer.model_pad_id
     cfg.eos_token_id = tokenizer.eos_id
     cfg.im_start_token_id = tokenizer.im_start_id
