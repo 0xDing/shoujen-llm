@@ -2,11 +2,10 @@
 
 Examples:
     # Single completion from a raw prompt
-    python scripts/infer.py --ckpt runs/sft/last.pt --vocab data/vocab.json \
-        --prompt "今天天气真好"
+    python scripts/infer.py --ckpt runs/sft/last.pt --prompt "今天天气真好"
 
     # Interactive chat mode
-    python scripts/infer.py --ckpt runs/sft/last.pt --vocab data/vocab.json --chat
+    python scripts/infer.py --ckpt runs/sft/last.pt --chat
 """
 
 from __future__ import annotations
@@ -23,14 +22,19 @@ sys.path.insert(0, str(REPO_ROOT))
 from shoujen.config import ShoujenConfig
 from shoujen.generate import generate
 from shoujen.model import ShoujenLM
-from shoujen.tokenizer import ShoujenTokenizer
+from shoujen.tokenizer import DEFAULT_TOKENIZER_ID, ShoujenTokenizer
 from shoujen.train_utils import pick_device
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
-    p.add_argument("--vocab", required=True)
+    p.add_argument(
+        "--vocab",
+        "--tokenizer",
+        default=DEFAULT_TOKENIZER_ID,
+        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+    )
     p.add_argument("--prompt", default=None)
     p.add_argument("--chat", action="store_true")
     p.add_argument("--system", default=None, help="System prompt for chat mode")

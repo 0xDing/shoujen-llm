@@ -1,15 +1,12 @@
-"""Character-level tokenizer with UTF-8 byte fallback.
+"""Tokenizer compatibility wrapper.
 
-Layout of the vocabulary:
-    0..3        Special tokens: <pad>, <eos>, <im_start>, <im_end>
-    4..259      Byte fallback tokens: <byte_00>..<byte_FF>
-    260..       Character tokens, one id per Unicode codepoint
+The default tokenizer is the Hugging Face tokenizer at
+`AgentBull/CJK-Tokenizer`. It extends the LLaMA tokenizer with single-token CJK
+characters while keeping LLaMA's normal subword behavior for other scripts.
 
-Text is normalized in both `from_charset` and `encode` via a two-step pipeline:
-    1. Strip control / bidi / zero-width noise (Nmt-inspired, but conservative
-       -- keeps \\t \\n \\r and ZWNJ/ZWJ).
-    2. NFKC, so fullwidth/halfwidth, ligatures, circled digits, etc. fold to
-       canonical forms.
+The legacy character-level tokenizer is still supported for old local
+`vocab.json` files and `scripts/build_tokenizer.py`, but new training and
+inference paths should call `ShoujenTokenizer.load()` without a local vocab.
 """
 
 from __future__ import annotations
@@ -19,6 +16,14 @@ import re
 import unicodedata
 from pathlib import Path
 from typing import Iterable, Sequence
+from urllib.parse import urlparse
+
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+
+DEFAULT_TOKENIZER_ID = "AgentBull/CJK-Tokenizer"
+IM_START_TOKEN = "<im_start>"
+IM_END_TOKEN = "<im_end>"
+PROJECT_ADDITIONAL_SPECIAL_TOKENS = [IM_START_TOKEN, IM_END_TOKEN]
 
 SPECIAL_TOKENS = ["<pad>", "<eos>", "<im_start>", "<im_end>"]
 PAD_ID, EOS_ID, IM_START_ID, IM_END_ID = 0, 1, 2, 3
@@ -60,8 +65,27 @@ def _byte_token_value(tok: str) -> int:
     return int(tok[6:8], 16)
 
 
+def _normalize_hf_tokenizer_source(source: str) -> str:
+    parsed = urlparse(source)
+    if parsed.scheme in {"http", "https"} and parsed.netloc == "huggingface.co":
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2:
+            return "/".join(parts[:2])
+    return source
+
+
 class ShoujenTokenizer:
-    def __init__(self, tokens: Sequence[str]):
+    def __init__(self, tokenizer_or_tokens: PreTrainedTokenizerBase | Sequence[str]):
+        self._hf_tokenizer: PreTrainedTokenizerBase | None = None
+        self._tokens: list[str] | None = None
+        self._id_of: dict[str, int] | None = None
+
+        if isinstance(tokenizer_or_tokens, PreTrainedTokenizerBase):
+            self._hf_tokenizer = tokenizer_or_tokens
+            self._ensure_project_tokens()
+            return
+
+        tokens = tokenizer_or_tokens
         if list(tokens[:BYTE_OFFSET]) != SPECIAL_TOKENS:
             raise ValueError("Vocab must start with the special tokens.")
         for i in range(N_BYTES):
@@ -70,23 +94,96 @@ class ShoujenTokenizer:
                 raise ValueError(
                     f"Vocab id {BYTE_OFFSET + i} must be {expected}, got {tokens[BYTE_OFFSET + i]}"
                 )
-        self._tokens: list[str] = list(tokens)
-        self._id_of: dict[str, int] = {t: i for i, t in enumerate(self._tokens)}
+        self._tokens = list(tokens)
+        self._id_of = {t: i for i, t in enumerate(self._tokens)}
+
+    @property
+    def is_hf(self) -> bool:
+        return self._hf_tokenizer is not None
+
+    @property
+    def hf_tokenizer(self) -> PreTrainedTokenizerBase:
+        if self._hf_tokenizer is None:
+            raise TypeError("This tokenizer was loaded from a legacy local vocab.json")
+        return self._hf_tokenizer
+
+    def _ensure_project_tokens(self) -> None:
+        tok = self.hf_tokenizer
+        missing_chat_tokens = [
+            token
+            for token in PROJECT_ADDITIONAL_SPECIAL_TOKENS
+            if tok.convert_tokens_to_ids(token) == tok.unk_token_id
+        ]
+        if missing_chat_tokens:
+            try:
+                tok.add_special_tokens(
+                    {"additional_special_tokens": missing_chat_tokens},
+                    replace_additional_special_tokens=False,
+                )
+            except TypeError:
+                existing = list(getattr(tok, "additional_special_tokens", []) or [])
+                tok.add_special_tokens(
+                    {"additional_special_tokens": existing + missing_chat_tokens}
+                )
+
+        missing = [
+            token
+            for token in PROJECT_ADDITIONAL_SPECIAL_TOKENS
+            if tok.convert_tokens_to_ids(token) == tok.unk_token_id
+        ]
+        if missing:
+            raise ValueError(f"Tokenizer is missing required special tokens: {missing}")
 
     @property
     def vocab_size(self) -> int:
+        if self._hf_tokenizer is not None:
+            return len(self._hf_tokenizer)
+        assert self._tokens is not None
         return len(self._tokens)
 
     @property
-    def pad_id(self) -> int: return PAD_ID
+    def pad_id(self) -> int:
+        if self._hf_tokenizer is not None:
+            token_id = self._hf_tokenizer.pad_token_id
+            return self.eos_id if token_id is None else int(token_id)
+        return PAD_ID
+
     @property
-    def eos_id(self) -> int: return EOS_ID
+    def model_pad_id(self) -> int | None:
+        if self._hf_tokenizer is not None:
+            token_id = self._hf_tokenizer.pad_token_id
+            return None if token_id is None else int(token_id)
+        return PAD_ID
+
     @property
-    def im_start_id(self) -> int: return IM_START_ID
+    def eos_id(self) -> int:
+        if self._hf_tokenizer is not None:
+            token_id = self._hf_tokenizer.eos_token_id
+            if token_id is None:
+                raise ValueError("Tokenizer does not define an eos token")
+            return int(token_id)
+        return EOS_ID
+
     @property
-    def im_end_id(self) -> int: return IM_END_ID
+    def im_start_id(self) -> int:
+        if self._hf_tokenizer is not None:
+            return int(self._hf_tokenizer.convert_tokens_to_ids(IM_START_TOKEN))
+        return IM_START_ID
+
+    @property
+    def im_end_id(self) -> int:
+        if self._hf_tokenizer is not None:
+            return int(self._hf_tokenizer.convert_tokens_to_ids(IM_END_TOKEN))
+        return IM_END_ID
 
     def encode(self, text: str, add_eos: bool = False) -> list[int]:
+        if self._hf_tokenizer is not None:
+            ids = self._hf_tokenizer.encode(text, add_special_tokens=False)
+            if add_eos:
+                ids.append(self.eos_id)
+            return [int(tid) for tid in ids]
+
+        assert self._id_of is not None
         ids: list[int] = []
         for ch in normalize(text):
             tid = self._id_of.get(ch)
@@ -99,7 +196,32 @@ class ShoujenTokenizer:
             ids.append(EOS_ID)
         return ids
 
+    def encode_batch(self, texts: Sequence[str], add_eos: bool = False) -> list[list[int]]:
+        if not texts:
+            return []
+        if self._hf_tokenizer is not None:
+            encoded = self._hf_tokenizer(
+                list(texts),
+                add_special_tokens=False,
+                padding=False,
+                truncation=False,
+            )["input_ids"]
+            eos_id = self.eos_id
+            if add_eos:
+                return [[int(tid) for tid in ids] + [eos_id] for ids in encoded]
+            return [[int(tid) for tid in ids] for ids in encoded]
+
+        return [self.encode(text, add_eos=add_eos) for text in texts]
+
     def decode(self, ids: Iterable[int], skip_special: bool = True) -> str:
+        if self._hf_tokenizer is not None:
+            return self._hf_tokenizer.decode(
+                list(ids),
+                skip_special_tokens=skip_special,
+                clean_up_tokenization_spaces=False,
+            )
+
+        assert self._tokens is not None
         out: list[str] = []
         byte_buf: list[int] = []
 
@@ -144,7 +266,7 @@ class ShoujenTokenizer:
         for m in messages:
             role = m["role"]
             content = m["content"]
-            ids.append(IM_START_ID); mask.append(0)
+            ids.append(self.im_start_id); mask.append(0)
             for tid in self.encode(role + "\n"):
                 ids.append(tid); mask.append(0)
             content_ids = self.encode(content)
@@ -152,23 +274,52 @@ class ShoujenTokenizer:
             for tid in content_ids:
                 ids.append(tid)
                 mask.append(1 if is_assistant else 0)
-            ids.append(IM_END_ID)
+            ids.append(self.im_end_id)
             mask.append(1 if is_assistant else 0)
             for tid in self.encode("\n"):
                 ids.append(tid); mask.append(0)
         if add_generation_prompt:
-            ids.append(IM_START_ID); mask.append(0)
+            ids.append(self.im_start_id); mask.append(0)
             for tid in self.encode("assistant\n"):
                 ids.append(tid); mask.append(0)
         return ids, mask
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
-        path.write_text(json.dumps(self._tokens, ensure_ascii=False))
+        if self._hf_tokenizer is not None:
+            path.mkdir(parents=True, exist_ok=True)
+            self._hf_tokenizer.save_pretrained(path)
+            return
+        assert self._tokens is not None
+        path.write_text(json.dumps(self._tokens, ensure_ascii=False), encoding="utf-8")
 
     @classmethod
-    def load(cls, path: str | Path) -> "ShoujenTokenizer":
-        tokens = json.loads(Path(path).read_text())
+    def from_pretrained(
+        cls,
+        model_id_or_path: str | Path = DEFAULT_TOKENIZER_ID,
+        **kwargs,
+    ) -> "ShoujenTokenizer":
+        source = _normalize_hf_tokenizer_source(str(model_id_or_path))
+        kwargs.setdefault("use_fast", False)
+        tokenizer = AutoTokenizer.from_pretrained(source, **kwargs)
+        return cls(tokenizer)
+
+    @classmethod
+    def load(cls, path: str | Path | None = None) -> "ShoujenTokenizer":
+        if path is None:
+            return cls.from_pretrained(DEFAULT_TOKENIZER_ID)
+
+        path_str = str(path)
+        path_obj = Path(path_str)
+        if path_obj.is_file():
+            tokens = json.loads(path_obj.read_text(encoding="utf-8"))
+            return cls(tokens)
+
+        return cls.from_pretrained(path_str)
+
+    @classmethod
+    def from_vocab_file(cls, path: str | Path) -> "ShoujenTokenizer":
+        tokens = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls(tokens)
 
     @classmethod
@@ -196,11 +347,7 @@ class ShoujenTokenizer:
 
 
 def default_charset() -> list[str]:
-    """A built-in fallback character coverage when external lists are unavailable.
-
-    Covers what the README requires *except* the heavy CJK lists. Use
-    scripts/build_tokenizer.py to produce a full vocab including CJK.
-    """
+    """Built-in coverage for the legacy local character tokenizer."""
     chars: set[str] = set()
     for cp in range(0x20, 0x7F):  # printable ASCII
         chars.add(chr(cp))

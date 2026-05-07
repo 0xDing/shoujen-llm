@@ -46,8 +46,14 @@ from scripts.train_staged_packed import (
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
-from shoujen.tokenizer import ShoujenTokenizer
-from shoujen.train_utils import autocast_dtype, pick_device, set_optimizer_lr
+from shoujen.tokenizer import DEFAULT_TOKENIZER_ID, ShoujenTokenizer
+from shoujen.train_utils import (
+    autocast_dtype,
+    pick_device,
+    set_optimizer_lr,
+    set_optimizer_momentum,
+    warmup_momentum,
+)
 
 
 MIN_VALID_LOSS = -1e-3
@@ -132,7 +138,12 @@ def parse_bool_list(raw: str) -> list[bool]:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
 
-    p.add_argument("--vocab", default="data/vocab.json", help="Path to tokenizer vocab.json")
+    p.add_argument(
+        "--vocab",
+        "--tokenizer",
+        default=DEFAULT_TOKENIZER_ID,
+        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+    )
     p.add_argument("--data-dir", type=Path, default=Path("data/processed-clean"))
     p.add_argument("--train-files", nargs="+", default=DEFAULT_TRAIN_FILES)
     p.add_argument("--val-file", default="s0-val.parquet")
@@ -199,6 +210,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--muon-lr-max", type=float, default=8e-4)
     p.add_argument("--adamw-lr-min", type=float, default=5e-5)
     p.add_argument("--adamw-lr-max", type=float, default=6e-4)
+    p.add_argument(
+        "--muon-momentum-start-min",
+        type=float,
+        default=0.70,
+        help="Lower bound for the searched initial Muon momentum (start of linear warmup to --muon-momentum-target).",
+    )
+    p.add_argument(
+        "--muon-momentum-start-max",
+        type=float,
+        default=0.95,
+        help="Upper bound for the searched initial Muon momentum.",
+    )
+    p.add_argument(
+        "--muon-momentum-target",
+        type=float,
+        default=0.95,
+        help="Fixed Muon momentum after warmup completes (not searched).",
+    )
+    p.add_argument(
+        "--attention-window",
+        type=int,
+        default=256,
+        help="Sliding-window size (W tokens) applied to all attention layers in trials and formal training. Pass 0 to disable.",
+    )
+    p.add_argument(
+        "--adamw-beta1",
+        type=float,
+        default=0.8,
+        help="AdamW beta1 used in trials and formal training (not searched).",
+    )
+    p.add_argument(
+        "--adamw-beta2",
+        type=float,
+        default=0.95,
+        help="AdamW beta2 used in trials and formal training (not searched).",
+    )
     p.add_argument("--warmup-ratio-min", type=float, default=0.02)
     p.add_argument("--warmup-ratio-max", type=float, default=0.10)
     p.add_argument("--lr-min-ratio-min", type=float, default=0.03)
@@ -318,6 +365,11 @@ def suggest_hparams(trial: Any, args: argparse.Namespace) -> dict[str, Any]:
         )
     else:
         params["muon_adaptive_beta2"] = 0.95
+    params["muon_momentum_start"] = trial.suggest_float(
+        "muon_momentum_start",
+        args.muon_momentum_start_min,
+        args.muon_momentum_start_max,
+    )
     return params
 
 
@@ -350,11 +402,16 @@ def make_trial_train_args(
         log_every=int(search_args.log_every),
         grad_clip=float(params["grad_clip"]),
         muon_lr=float(params["muon_lr"]),
+        muon_momentum=float(search_args.muon_momentum_target),
+        muon_momentum_start=float(params["muon_momentum_start"]),
+        muon_momentum_warmup=None,
         muon_ns_steps=int(params["muon_ns_steps"]),
         muon_adaptive=bool(params["muon_adaptive"]),
         muon_adaptive_beta2=float(params["muon_adaptive_beta2"]),
         muon_adaptive_eps=1e-8,
         adamw_lr=float(params["adamw_lr"]),
+        adamw_beta1=float(search_args.adamw_beta1),
+        adamw_beta2=float(search_args.adamw_beta2),
         muon_wd=float(params["muon_wd"]),
         adamw_wd=float(params["adamw_wd"]),
         adamw_independent_wd=bool(params["adamw_independent_wd"]),
@@ -364,6 +421,7 @@ def make_trial_train_args(
         lr_min_ratio=float(params["lr_min_ratio"]),
         lr_stable_steps=max(0, int(round(schedule_steps * float(params["lr_stable_ratio"])))),
         qk_norm=bool(params["qk_norm"]),
+        attention_window=int(search_args.attention_window),
         z_loss_weight=float(params["z_loss_weight"]),
         log_max_qk_logit=bool(search_args.track_qk),
         shuffle_buffer_size=int(search_args.shuffle_buffer_size),
@@ -520,18 +578,23 @@ def run_one_seed(
     muon, adamw = build_optimizers(
         model,
         muon_lr=train_args.muon_lr,
+        muon_momentum=train_args.muon_momentum,
         muon_ns_steps=train_args.muon_ns_steps,
         muon_wd=train_args.muon_wd,
         muon_adaptive=train_args.muon_adaptive,
         muon_adaptive_beta2=train_args.muon_adaptive_beta2,
         muon_adaptive_eps=train_args.muon_adaptive_eps,
         adamw_lr=train_args.adamw_lr,
+        adamw_betas=(train_args.adamw_beta1, train_args.adamw_beta2),
         adamw_wd=train_args.adamw_wd,
         adamw_embed_wd=train_args.adamw_embed_wd if train_args.adamw_independent_wd else None,
         adamw_foreach=True if train_args.adamw_foreach else None,
     )
     base_muon_lrs = [group["lr"] for group in muon.param_groups]
     base_adamw_lrs = [group["lr"] for group in adamw.param_groups]
+    muon_mom_warmup = (
+        train_args.warmup if train_args.muon_momentum_warmup is None else train_args.muon_momentum_warmup
+    )
 
     initial_val_loss = None
     if search_args.eval_initial:
@@ -595,6 +658,13 @@ def run_one_seed(
                     mult = lr_multiplier(train_args, global_step, schedule_steps)
                     set_optimizer_lr(muon, base_muon_lrs, mult)
                     set_optimizer_lr(adamw, base_adamw_lrs, mult)
+                    mom_now = warmup_momentum(
+                        global_step,
+                        warmup=muon_mom_warmup,
+                        start=train_args.muon_momentum_start,
+                        end=train_args.muon_momentum,
+                    )
+                    set_optimizer_momentum(muon, mom_now)
                     step_train_losses = []
 
                 with torch.autocast(
@@ -973,6 +1043,10 @@ def build_formal_command(args: argparse.Namespace, params: dict[str, Any]) -> st
         fmt_float(float(params["grad_clip"])),
         "--muon-lr",
         fmt_float(float(params["muon_lr"])),
+        "--muon-momentum",
+        fmt_float(float(args.muon_momentum_target)),
+        "--muon-momentum-start",
+        fmt_float(float(params["muon_momentum_start"])),
         "--muon-ns-steps",
         str(int(params["muon_ns_steps"])),
         "--muon-wd",
@@ -981,10 +1055,16 @@ def build_formal_command(args: argparse.Namespace, params: dict[str, Any]) -> st
         fmt_float(float(params["muon_adaptive_beta2"])),
         "--adamw-lr",
         fmt_float(float(params["adamw_lr"])),
+        "--adamw-beta1",
+        fmt_float(float(args.adamw_beta1)),
+        "--adamw-beta2",
+        fmt_float(float(args.adamw_beta2)),
         "--adamw-wd",
         fmt_float(float(params["adamw_wd"])),
         "--adamw-embed-wd",
         fmt_float(float(params["adamw_embed_wd"])),
+        "--attention-window",
+        str(int(args.attention_window)),
         "--lr-schedule",
         str(params["lr_schedule"]),
         "--lr-min-ratio",

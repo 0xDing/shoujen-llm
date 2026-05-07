@@ -16,43 +16,32 @@ The mix is intentional: classical Chinese gives the model a stylistic and semant
 
 ## Tokenizer
 
-Character-level tokenizer.
+The default tokenizer is loaded directly from
+[`AgentBull/CJK-Tokenizer`](https://huggingface.co/AgentBull/CJK-Tokenizer):
 
-Coverage:
-- All ASCII characters
-- Greek basic block
-- Cyrillic basic block
-- Japanese hiragana and katakana
-- CJK / English / Japanese / Korean common punctuation
-- Digits 0–9, one token per digit
-- CJK ideographs sourced from [zispace/hanzi-chars](https://github.com/zispace/hanzi-chars):
-  - PRC *Tongyong Guifan Hanzi Biao* levels 1/2/3
-  - Hong Kong *Soengjung Zihbiu*
-  - Taiwan *Changyong Guozi Biao*
-  - Taiwan *Cichangyong Guozi Biao*
-  - Japan *Jōyō Kanji*
-  - Japan *Gakunenbetsu Kanji Haitōhyō*
-  - Korea *Hanmun Gyoyukyong Gicho Hanja*
+```python
+from transformers import AutoTokenizer
 
-Unknown characters fall back to UTF-8 byte tokens.
+tokenizer = AutoTokenizer.from_pretrained("AgentBull/CJK-Tokenizer")
+```
 
-Special tokens:
-`<pad>`, `<eos>`, `<im_start>`, `<im_end>`
-
-Final vocabulary: `./data/vocab.json`
+It is a LLaMA tokenizer extended with single-token CJK characters. CJK text is
+mostly character-level, while Latin text, punctuation, and other scripts keep
+the original LLaMA subword behavior. Shoujen adds only the chat boundary tokens
+`<im_start>` and `<im_end>` at load time; there is no dedicated pad token in
+the default tokenizer path. Packed pretraining uses EOS-separated chunks.
 
 ### Tokenizer design trade-offs
 
 **Why character-level instead of BPE / SentencePiece?**
 
-- *For classical Chinese, characters already are the morphemes.* A single 字 is a meaningful unit (often a whole word in pre-Tang prose). BPE merges trained on a modern corpus would just rediscover the character boundaries — and worse, it would learn merges biased toward modern bigrams (e.g. `的`-prefixed pairs), which are rare in classical text. Character-level avoids that mismatch.
-- *Cross-register robustness.* The same model needs to read 《左傳》 and a modern Wikipedia paragraph in the same forward pass. With a character tokenizer, the unit of meaning is consistent across registers; with subword BPE, the same surface character can sit inside very different merges depending on training-data dominance.
-- *Tiny vocabulary, tied embeddings.* The vocab is roughly 20k entries (specials + 256 byte fallbacks + ~20k CJK + Latin/Greek/Cyrillic/kana). With `tie_word_embeddings=True`, the embedding + LM-head matrix is small enough that we can afford `hidden_size=512` without the I/O dominating parameter count — important when training on a single M1 Ultra.
-- *No tokenizer training step.* The character set is enumerated from public Unicode lists; there is no corpus-dependent training pass for the tokenizer itself. This makes the vocab fully reproducible and decouples tokenizer iteration from corpus iteration.
+- *For classical Chinese, characters already are the morphemes.* A single 字 is a meaningful unit, often a whole word in pre-Tang prose. Keeping CJK characters atomic avoids merge rules biased toward modern high-frequency phrases.
+- *Cross-register robustness.* The same model needs to read 《左傳》 and a modern Wikipedia paragraph in the same forward pass. CJK character tokens keep the core unit stable across registers, while LLaMA subwords keep English and code from exploding to byte- or character-level lengths.
+- *No local tokenizer build step.* Training and inference load the same published tokenizer id, so `data/vocab.json` is no longer required for the default path.
 
-**The cost** is sequence length: a Chinese sentence that BPE would compress into ~20 tokens stays at ~20–40 characters here (already near 1:1 for classical Chinese), and English text becomes ~4× longer than under BPE. The model is small and the corpus is Chinese-dominant, so we eat that cost; on a larger English-heavy run this trade-off would flip.
-
-**The byte fallback** keeps the tokenizer total: any character outside the curated set (rare ideographs, emoji, exotic scripts) decomposes into 1–4 UTF-8 byte tokens. This is the same failsafe that ByT5 / Llama-style byte fallback BPE uses, just without the BPE part on top.
+**The cost** is that Chinese text is still close to character length. That is
+acceptable for this Chinese-dominant model, and the inherited LLaMA tokenizer
+keeps English-heavy spans more compact than the old pure character tokenizer.
 
 ## Model
 
@@ -104,13 +93,38 @@ Training objectives:
 - SFT stage: assistant-only loss (mask provided by the chat-template encoder).
 - Auxiliary loss: [Semantic Tube Prediction](https://github.com/galilai-group/llm-jepa#stp) is reserved for a future SFT path where message-local spans are available. It is not applied during packed pretraining, because random STP triples must not cross unrelated documents.
 
+### Offline tokenized packed pretraining
+
+After building and deduplicating `data/processed-clean/*.parquet`, the text
+shards can be tokenized and document-packed once so training workers read ready
+blocks instead of running the tokenizer:
+
+```bash
+uv run python scripts/build_packed_tokenized_corpus.py \
+  --source-dir data/processed-clean \
+  --out-dir data/processed-packed \
+  --block-size 2048 \
+  --tokenizer-workers 8
+```
+
+Then train from the preprocessed shards:
+
+```bash
+uv run python scripts/train_staged_packed.py \
+  --data-dir data/processed-packed \
+  --data-format packed \
+  --block-size 2048
+```
+
+`--data-format auto` also detects these shards from parquet columns, but
+passing `packed` fails fast if the wrong input is provided.
+
 ### Trainer-based packed pretraining
 
 The staged parquet pretraining path also has a Transformers `Trainer` entrypoint:
 
 ```bash
 uv run python scripts/train_trainer_staged_packed.py \
-  --vocab data/vocab.json \
   --data-dir data/processed-clean \
   --batch-size 3 \
   --gradient-accumulation-steps 1 \

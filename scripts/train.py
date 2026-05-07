@@ -4,7 +4,6 @@ Examples:
     # Pretraining
     python scripts/train.py \
         --mode pretrain \
-        --vocab data/vocab.json \
         --corpus data/corpus.jsonl \
         --output runs/pretrain \
         --batch-size 4 --block-size 1024 --max-steps 20000
@@ -12,7 +11,6 @@ Examples:
     # SFT (initialise from a pretraining checkpoint)
     python scripts/train.py \
         --mode sft \
-        --vocab data/vocab.json \
         --sft data/sft.jsonl \
         --init-ckpt runs/pretrain/last.pt \
         --output runs/sft \
@@ -36,7 +34,7 @@ from shoujen.data import PackedPretrainDataset, SFTDataset, collate
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
-from shoujen.tokenizer import ShoujenTokenizer
+from shoujen.tokenizer import DEFAULT_TOKENIZER_ID, ShoujenTokenizer
 from shoujen.train_utils import (
     autocast_dtype,
     load_checkpoint,
@@ -44,15 +42,22 @@ from shoujen.train_utils import (
     pick_device,
     save_checkpoint,
     set_optimizer_lr,
-    warmup_stable_decay_lr,
+    set_optimizer_momentum,
     warmup_cosine_lr,
+    warmup_momentum,
+    warmup_stable_decay_lr,
 )
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["pretrain", "sft"], required=True)
-    p.add_argument("--vocab", required=True, help="Path to tokenizer vocab.json")
+    p.add_argument(
+        "--vocab",
+        "--tokenizer",
+        default=DEFAULT_TOKENIZER_ID,
+        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+    )
     p.add_argument("--corpus", help="Path to pretraining corpus (jsonl/dir/.txt)")
     p.add_argument("--sft", help="Path to SFT jsonl")
     p.add_argument("--cache", help="Path to pretokenized memmap (pretraining only)")
@@ -70,11 +75,26 @@ def parse_args():
     p.add_argument("--grad-clip", type=float, default=1.0)
 
     p.add_argument("--muon-lr", type=float, default=3e-4)
+    p.add_argument("--muon-momentum", type=float, default=0.95, help="Target Muon momentum after warmup")
+    p.add_argument(
+        "--muon-momentum-start",
+        type=float,
+        default=0.85,
+        help="Initial Muon momentum at step 0 (linearly ramped to --muon-momentum over --muon-momentum-warmup steps)",
+    )
+    p.add_argument(
+        "--muon-momentum-warmup",
+        type=int,
+        default=None,
+        help="Steps to ramp Muon momentum from start to target (defaults to --warmup if unset; pass 0 to disable)",
+    )
     p.add_argument("--muon-ns-steps", type=int, default=5)
     p.add_argument("--muon-adaptive", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--muon-adaptive-beta2", type=float, default=0.95)
     p.add_argument("--muon-adaptive-eps", type=float, default=1e-8)
     p.add_argument("--adamw-lr", type=float, default=3e-4)
+    p.add_argument("--adamw-beta1", type=float, default=0.8)
+    p.add_argument("--adamw-beta2", type=float, default=0.95)
     p.add_argument("--muon-wd", type=float, default=0.0)
     p.add_argument("--adamw-wd", type=float, default=0.1)
     p.add_argument("--adamw-independent-wd", action=argparse.BooleanOptionalAction, default=True)
@@ -84,6 +104,13 @@ def parse_args():
     p.add_argument("--lr-min-ratio", type=float, default=0.1)
     p.add_argument("--lr-stable-steps", type=int, default=0)
     p.add_argument("--qk-norm", action="store_true")
+    p.add_argument(
+        "--attention-window",
+        type=int,
+        default=256,
+        help="Sliding-window size for attention layers (W tokens). Pass 0 or a "
+        "negative value to disable; RWKV layers are unaffected.",
+    )
     p.add_argument("--z-loss-weight", type=float, default=1e-4)
     p.add_argument("--log-max-qk-logit", action="store_true")
 
@@ -100,13 +127,15 @@ def build_config(args, tokenizer: ShoujenTokenizer) -> ShoujenConfig:
     else:
         cfg = ShoujenConfig()
     cfg.vocab_size = tokenizer.vocab_size
-    cfg.pad_token_id = tokenizer.pad_id
+    cfg.pad_token_id = tokenizer.model_pad_id
     cfg.eos_token_id = tokenizer.eos_id
     cfg.im_start_token_id = tokenizer.im_start_id
     cfg.im_end_token_id = tokenizer.im_end_id
     cfg.max_seq_len = max(cfg.max_seq_len, args.block_size)
     if getattr(args, "qk_norm", False):
         cfg.qk_norm = True
+    window = getattr(args, "attention_window", None)
+    cfg.attention_window = window if window and window > 0 else None
     return cfg
 
 
@@ -159,18 +188,21 @@ def main():
     muon, adamw = build_optimizers(
         model,
         muon_lr=args.muon_lr,
+        muon_momentum=args.muon_momentum,
         muon_ns_steps=args.muon_ns_steps,
         muon_wd=args.muon_wd,
         muon_adaptive=args.muon_adaptive,
         muon_adaptive_beta2=args.muon_adaptive_beta2,
         muon_adaptive_eps=args.muon_adaptive_eps,
         adamw_lr=args.adamw_lr,
+        adamw_betas=(args.adamw_beta1, args.adamw_beta2),
         adamw_wd=args.adamw_wd,
         adamw_embed_wd=args.adamw_embed_wd if args.adamw_independent_wd else None,
         adamw_foreach=True if args.adamw_foreach else None,
     )
     base_muon_lrs = [g["lr"] for g in muon.param_groups]
     base_adamw_lrs = [g["lr"] for g in adamw.param_groups]
+    muon_mom_warmup = args.warmup if args.muon_momentum_warmup is None else args.muon_momentum_warmup
 
     start_step = 0
     if args.init_ckpt:
@@ -224,6 +256,13 @@ def main():
             mult = lr_multiplier(args, step, args.max_steps)
             set_optimizer_lr(muon, base_muon_lrs, mult)
             set_optimizer_lr(adamw, base_adamw_lrs, mult)
+            mom_now = warmup_momentum(
+                step,
+                warmup=muon_mom_warmup,
+                start=args.muon_momentum_start,
+                end=args.muon_momentum,
+            )
+            set_optimizer_momentum(muon, mom_now)
 
             with autocast():
                 out_m = model(input_ids, use_cache=False)

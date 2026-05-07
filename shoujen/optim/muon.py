@@ -195,7 +195,7 @@ def build_optimizers(
     muon_adaptive_beta2: float = 0.95,
     muon_adaptive_eps: float = 1e-8,
     adamw_lr: float = 3e-4,
-    adamw_betas: tuple[float, float] = (0.9, 0.95),
+    adamw_betas: tuple[float, float] = (0.8, 0.95),
     adamw_eps: float = 1e-8,
     adamw_wd: float = 0.1,
     adamw_embed_wd: float | None = 0.0,

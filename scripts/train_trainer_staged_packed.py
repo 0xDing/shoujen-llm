@@ -28,7 +28,7 @@ from shoujen.data import PackedParquetPretrainDataset, packed_collate
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import MultipleOptimizer, build_optimizers
-from shoujen.tokenizer import ShoujenTokenizer
+from shoujen.tokenizer import DEFAULT_TOKENIZER_ID, ShoujenTokenizer
 from shoujen.train_utils import autocast_dtype, load_checkpoint, pick_device, warmup_cosine_lr, warmup_stable_decay_lr
 
 
@@ -75,7 +75,12 @@ class StagedPackedParquetDataset(IterableDataset):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--vocab", default="data/vocab.json", help="Path to tokenizer vocab.json")
+    p.add_argument(
+        "--vocab",
+        "--tokenizer",
+        default=DEFAULT_TOKENIZER_ID,
+        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+    )
     p.add_argument("--data-dir", type=Path, default=Path("data/processed-clean"))
     p.add_argument("--train-files", nargs="+", default=DEFAULT_TRAIN_FILES)
     p.add_argument("--val-file", default="s0-val.parquet")

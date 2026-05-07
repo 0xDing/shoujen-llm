@@ -407,6 +407,7 @@ class ShoujenModel(ShoujenPreTrainedModel):
     ) -> torch.Tensor:
         total_len = past_seen_tokens + seq_len
         min_dtype = -torch.finfo(dtype).max
+        window = self.config.attention_window
         if attention_mask is not None and attention_mask.ndim in (3, 4):
             attention_mask = attention_mask.to(device=device)
             if attention_mask.ndim == 3:
@@ -419,16 +420,23 @@ class ShoujenModel(ShoujenPreTrainedModel):
                 )
             if attention_mask.dtype == torch.bool:
                 packed_mask = torch.zeros(expected, dtype=dtype, device=device)
-                return packed_mask.masked_fill(~attention_mask, min_dtype)
-            return attention_mask.to(dtype=dtype)
+                packed_mask = packed_mask.masked_fill(~attention_mask, min_dtype)
+            else:
+                packed_mask = attention_mask.to(dtype=dtype)
+            if window is not None:
+                window_blocked = self._window_blocked(seq_len, total_len, past_seen_tokens, window, device)
+                packed_mask = packed_mask.masked_fill(window_blocked, min_dtype)
+            return packed_mask
 
         if attention_mask is None and past_seen_tokens == 0:
-            cache_key = (str(device), dtype, seq_len)
+            cache_key = (str(device), dtype, seq_len, window)
             cached = self._causal_mask_cache.get(cache_key)
             if cached is None:
                 row_ids = torch.arange(seq_len, device=device)[:, None]
                 col_ids = torch.arange(seq_len, device=device)[None, :]
                 allowed = col_ids <= row_ids
+                if window is not None:
+                    allowed = allowed & ((row_ids - col_ids) < window)
                 causal_mask = torch.zeros(seq_len, seq_len, dtype=dtype, device=device)
                 causal_mask = causal_mask.masked_fill(~allowed, min_dtype)
                 cached = causal_mask[None, None, :, :]
@@ -438,6 +446,8 @@ class ShoujenModel(ShoujenPreTrainedModel):
         row_ids = torch.arange(seq_len, device=device)[:, None] + past_seen_tokens
         col_ids = torch.arange(total_len, device=device)[None, :]
         allowed = col_ids <= row_ids
+        if window is not None:
+            allowed = allowed & ((row_ids - col_ids) < window)
         causal_mask = torch.zeros(seq_len, total_len, dtype=dtype, device=device)
         causal_mask = causal_mask.masked_fill(~allowed, min_dtype)
         causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, seq_len, total_len)
@@ -460,6 +470,20 @@ class ShoujenModel(ShoujenPreTrainedModel):
             padding_mask = attention_mask[:, None, None, :].to(torch.bool)
             causal_mask = causal_mask.masked_fill(~padding_mask, min_dtype)
         return causal_mask
+
+    @staticmethod
+    def _window_blocked(
+        seq_len: int,
+        total_len: int,
+        past_seen_tokens: int,
+        window: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Bool tensor (1, 1, seq_len, total_len): True where the position is
+        outside the sliding window (and should be masked to -inf)."""
+        row_ids = torch.arange(seq_len, device=device)[:, None] + past_seen_tokens
+        col_ids = torch.arange(total_len, device=device)[None, :]
+        return ((row_ids - col_ids) >= window).unsqueeze(0).unsqueeze(0)
 
     def forward(
         self,

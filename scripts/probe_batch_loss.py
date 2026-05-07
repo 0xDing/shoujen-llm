@@ -37,7 +37,7 @@ from scripts.train_staged_packed import (
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
-from shoujen.tokenizer import ShoujenTokenizer
+from shoujen.tokenizer import DEFAULT_TOKENIZER_ID, ShoujenTokenizer
 from shoujen.train_utils import autocast_dtype, pick_device, set_optimizer_lr
 
 
@@ -84,7 +84,12 @@ def parse_candidates(raw: str) -> list[Candidate]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--vocab", default="data/vocab.json")
+    p.add_argument(
+        "--vocab",
+        "--tokenizer",
+        default=DEFAULT_TOKENIZER_ID,
+        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+    )
     p.add_argument("--data-dir", type=Path, default=Path("data/processed-clean"))
     p.add_argument("--train-files", nargs="+", default=["s-init.parquet"])
     p.add_argument("--val-file", default="s0-val.parquet")

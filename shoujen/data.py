@@ -23,6 +23,7 @@ span boundaries to the STP loss so it never samples across unrelated text.
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -31,6 +32,8 @@ import torch
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from shoujen.tokenizer import ShoujenTokenizer
+
+PREPACKED_COLUMNS = ("token_ids", "seq_ids", "position_ids", "sequence_starts")
 
 
 def _iter_text_documents(path: Path) -> Iterator[str]:
@@ -170,6 +173,138 @@ def packed_collate(batch: list[dict]) -> dict:
     return out
 
 
+def is_prepacked_parquet(path: str | Path) -> bool:
+    try:
+        import pyarrow.parquet as pq
+
+        names = set(pq.ParquetFile(str(path)).schema_arrow.names)
+    except Exception:
+        return False
+    return set(PREPACKED_COLUMNS).issubset(names)
+
+
+def prepacked_parquet_metadata(path: str | Path) -> dict[str, str]:
+    import pyarrow.parquet as pq
+
+    metadata = pq.ParquetFile(str(path)).schema_arrow.metadata or {}
+    return {
+        key.decode("utf-8", errors="replace"): value.decode("utf-8", errors="replace")
+        for key, value in metadata.items()
+    }
+
+
+class PrepackedParquetPretrainDataset(IterableDataset):
+    """Read offline tokenized and packed LM blocks from parquet.
+
+    Expected columns are full-length `block_size + 1` arrays:
+    `token_ids`, `seq_ids`, `position_ids`, and `sequence_starts`. The dataset
+    derives shifted labels and the per-token loss mask at read time, matching
+    `PackedParquetPretrainDataset` without per-worker tokenization.
+    """
+
+    def __init__(
+        self,
+        parquet_path: str | Path,
+        block_size: int,
+        *,
+        shuffle: bool = True,
+        shuffle_buffer_size: int = 1024,
+        seed: int = 1337,
+        repeat: bool = False,
+        read_batch_size: int = 1024,
+    ):
+        self.parquet_path = Path(parquet_path)
+        self.block_size = block_size
+        self.shuffle = shuffle
+        self.shuffle_buffer_size = max(1, shuffle_buffer_size)
+        self.seed = seed
+        self.repeat = repeat
+        self.read_batch_size = read_batch_size
+        metadata = prepacked_parquet_metadata(self.parquet_path)
+        stored_block_size = metadata.get("block_size")
+        if stored_block_size is not None and int(stored_block_size) != block_size:
+            raise ValueError(
+                f"{self.parquet_path} was packed with block_size={stored_block_size}; "
+                f"training requested block_size={block_size}"
+            )
+
+    def _iter_records(self):
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(str(self.parquet_path))
+        row_groups = list(range(pf.metadata.num_row_groups))
+        worker = get_worker_info()
+        worker_id = 0
+        if worker is not None:
+            worker_id = worker.id
+            row_groups = [
+                row_group
+                for i, row_group in enumerate(row_groups)
+                if i % worker.num_workers == worker.id
+            ]
+
+        for batch in pf.iter_batches(
+            batch_size=self.read_batch_size,
+            row_groups=row_groups,
+            columns=["token_ids", "seq_ids", "position_ids", "sequence_starts"],
+        ):
+            columns = [batch.column(name).to_pylist() for name in PREPACKED_COLUMNS]
+            cols = dict(zip(PREPACKED_COLUMNS, columns))
+            for token_ids, seq_ids, position_ids, sequence_starts in zip(
+                cols["token_ids"],
+                cols["seq_ids"],
+                cols["position_ids"],
+                cols["sequence_starts"],
+            ):
+                yield token_ids, seq_ids, position_ids, sequence_starts, worker_id
+
+    def _sample_from_record(self, record: tuple) -> dict:
+        token_ids, seq_ids, position_ids, sequence_starts, _worker_id = record
+        expected_len = self.block_size + 1
+        if not (
+            len(token_ids)
+            == len(seq_ids)
+            == len(position_ids)
+            == len(sequence_starts)
+            == expected_len
+        ):
+            raise ValueError(
+                f"prepacked sample length mismatch in {self.parquet_path}: "
+                f"expected {expected_len}"
+            )
+        return _make_packed_pretrain_sample(
+            token_ids,
+            seq_ids,
+            position_ids,
+            sequence_starts,
+            self.block_size,
+        )
+
+    def __iter__(self):
+        epoch = 0
+        while True:
+            worker = get_worker_info()
+            worker_id = worker.id if worker is not None else 0
+            rng = random.Random(self.seed + epoch * 1009 + worker_id)
+            if self.shuffle:
+                buffer: list[tuple] = []
+                for record in self._iter_records():
+                    buffer.append(record)
+                    if len(buffer) >= self.shuffle_buffer_size:
+                        idx = rng.randrange(len(buffer))
+                        yield self._sample_from_record(buffer.pop(idx))
+                rng.shuffle(buffer)
+                for record in buffer:
+                    yield self._sample_from_record(record)
+            else:
+                for record in self._iter_records():
+                    yield self._sample_from_record(record)
+
+            if not self.repeat:
+                break
+            epoch += 1
+
+
 class PackedParquetPretrainDataset(IterableDataset):
     """Stream parquet text rows and emit fixed-size packed LM blocks.
 
@@ -293,14 +428,16 @@ class SFTDataset(Dataset):
         T = self.block_size
         ids_arr = ids_full[: T + 1]
         mask_arr = mask_full[: T + 1]
+        valid_len = len(ids_arr)
         if len(ids_arr) < T + 1:
             pad = T + 1 - len(ids_arr)
             ids_arr = ids_arr + [self.tokenizer.pad_id] * pad
             mask_arr = mask_arr + [0] * pad
         ids = torch.tensor(ids_arr[:-1], dtype=torch.long)
         labels = torch.tensor(ids_arr[1:], dtype=torch.long)
-        # Replace pad target with -100 so cross-entropy ignores it
-        labels = torch.where(labels == self.tokenizer.pad_id, torch.full_like(labels, -100), labels)
+        # If pad_id falls back to eos_id, ignore by position rather than token id.
+        if valid_len < T + 1:
+            labels[valid_len - 1 :] = -100
         loss_mask = torch.tensor(mask_arr[1:], dtype=torch.float32)  # supervise t+1 if it is assistant
         return {
             "input_ids": ids,

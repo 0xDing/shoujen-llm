@@ -33,6 +33,7 @@ class ShoujenConfig(PretrainedConfig):
         head_dim: int = 64,
         rope_theta: float = 10000.0,
         attention_dropout: float = 0.0,
+        attention_window: int | None = None,
         qk_norm: bool = False,
         qk_norm_eps: float | None = None,
         intermediate_size: int = 2048,
@@ -43,7 +44,7 @@ class ShoujenConfig(PretrainedConfig):
         initializer_range: float = 0.02,
         max_seq_len: int = 2048,
         max_position_embeddings: int | None = None,
-        pad_token_id: int = 0,
+        pad_token_id: int | None = 0,
         eos_token_id: int = 1,
         im_start_token_id: int = 2,
         im_end_token_id: int = 3,
@@ -98,6 +99,7 @@ class ShoujenConfig(PretrainedConfig):
         self.head_dim = head_dim
         self.rope_theta = rope_theta
         self.attention_dropout = attention_dropout
+        self.attention_window = attention_window
         self.qk_norm = qk_norm
         self.qk_norm_eps = rms_norm_eps if qk_norm_eps is None else qk_norm_eps
 
@@ -142,6 +144,8 @@ class ShoujenConfig(PretrainedConfig):
             )
         if self.attnres_block_size <= 0:
             raise ValueError("attnres_block_size must be positive")
+        if self.attention_window is not None and self.attention_window <= 0:
+            raise ValueError("attention_window must be positive when set")
 
     @property
     def num_rwkv_heads(self) -> int:

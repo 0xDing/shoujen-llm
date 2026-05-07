@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 CHUNK_SIZE = 2000
 BATCH_FLUSH = 10000
+JSON_ARRAY_READ_SIZE = 1024 * 1024
 DATA_ROOT = Path("data/train/s-init")
 DEFAULT_OUT = Path("data/processed/s-init.parquet")
 
@@ -182,31 +183,113 @@ def process_jsonl(path: Path, sink, limit: int | None) -> None:
     emit_from_buffer(buffer, source, True, sink)
 
 
-def process_json_array(path: Path, sink, limit: int | None) -> None:
-    source = path.name
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"warn: {source} failed to parse: {e}", file=sys.stderr)
-        return
-    if not isinstance(data, list):
-        print(f"warn: {source} top-level is not a list", file=sys.stderr)
-        return
-
+def iter_json_array(path: Path):
+    decoder = json.JSONDecoder()
     buffer = ""
-    for i, rec in enumerate(data):
-        if limit is not None and i >= limit:
-            break
-        if not isinstance(rec, dict):
-            continue
+    pos = 0
+    eof = False
+
+    def fill(f) -> None:
+        nonlocal buffer, eof
+        chunk = f.read(JSON_ARRAY_READ_SIZE)
+        if chunk:
+            buffer += chunk
+        else:
+            eof = True
+
+    with open(path, encoding="utf-8") as f:
+        fill(f)
+        while True:
+            while pos < len(buffer) and buffer[pos].isspace():
+                pos += 1
+            if pos < len(buffer) or eof:
+                break
+            buffer = ""
+            pos = 0
+            fill(f)
+        if pos >= len(buffer) or buffer[pos] != "[":
+            raise ValueError("top-level is not a JSON array")
+        pos += 1
+
+        while True:
+            while True:
+                while pos < len(buffer) and buffer[pos].isspace():
+                    pos += 1
+                if pos < len(buffer) or eof:
+                    break
+                buffer = ""
+                pos = 0
+                fill(f)
+            if pos >= len(buffer):
+                return
+            if buffer[pos] == "]":
+                return
+            if buffer[pos] == ",":
+                pos += 1
+                continue
+
+            while True:
+                try:
+                    rec, end = decoder.raw_decode(buffer, pos)
+                    pos = end
+                    yield rec
+                    if pos > JSON_ARRAY_READ_SIZE:
+                        buffer = buffer[pos:]
+                        pos = 0
+                    break
+                except json.JSONDecodeError:
+                    if eof:
+                        raise
+                    if pos > 0:
+                        buffer = buffer[pos:]
+                        pos = 0
+                    fill(f)
+
+
+def json_array_record(rec: dict, idx: int, default_source: str) -> tuple[str, str]:
+    record_source = str(rec.get("source") or default_source)
+    if "completion" in rec:
+        return str(rec.get("completion") or ""), record_source
+
+    if any(key in rec for key in ("query", "thought", "answer")):
         q = rec.get("query") or ""
         t = rec.get("thought") or ""
         a = rec.get("answer") or ""
-        text = q + "\n" + t + "\n" + a
-        buffer = feed(buffer, text, source, sink)
+        return f"{q}\n{t}\n{a}", record_source
 
-    emit_from_buffer(buffer, source, True, sink)
+    if "text" in rec:
+        return str(rec.get("text") or ""), record_source
+
+    if "content" in rec:
+        return str(rec.get("content") or ""), record_source
+
+    return "", record_source
+
+
+def process_json_array(path: Path, sink, limit: int | None) -> None:
+    source = path.name
+
+    buffer = ""
+    seen = 0
+    last_source = source
+    try:
+        records = iter_json_array(path)
+        for rec in records:
+            if limit is not None and seen >= limit:
+                break
+            if not isinstance(rec, dict):
+                continue
+            text, record_source = json_array_record(rec, seen, source)
+            if not text:
+                continue
+            buffer = feed(buffer, text, record_source, sink)
+            last_source = record_source
+            seen += 1
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        print(f"warn: {source} failed to parse: {e}", file=sys.stderr)
+        return
+
+    emit_from_buffer(buffer, last_source, True, sink)
 
 
 def process_text(path: Path, sink, limit: int | None) -> None:

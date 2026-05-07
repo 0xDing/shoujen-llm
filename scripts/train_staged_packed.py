@@ -8,7 +8,6 @@ Validation always uses:
 
 Example:
     uv run python scripts/train_staged_packed.py \
-        --vocab data/vocab.json \
         --output runs/staged-packed \
         --batch-size 4 --block-size 2048 \
         --eval-every 500 --wandb
@@ -30,11 +29,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.train import build_config
-from shoujen.data import PackedParquetPretrainDataset, packed_collate
+from shoujen.data import (
+    PackedParquetPretrainDataset,
+    PrepackedParquetPretrainDataset,
+    is_prepacked_parquet,
+    packed_collate,
+)
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
-from shoujen.tokenizer import ShoujenTokenizer
+from shoujen.tokenizer import DEFAULT_TOKENIZER_ID, ShoujenTokenizer
 from shoujen.train_utils import (
     autocast_dtype,
     load_checkpoint,
@@ -42,8 +46,10 @@ from shoujen.train_utils import (
     pick_device,
     save_checkpoint,
     set_optimizer_lr,
-    warmup_stable_decay_lr,
+    set_optimizer_momentum,
     warmup_cosine_lr,
+    warmup_momentum,
+    warmup_stable_decay_lr,
 )
 
 DEFAULT_TRAIN_FILES = [
@@ -56,11 +62,22 @@ DEFAULT_TRAIN_FILES = [
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--vocab", default="data/vocab.json", help="Path to tokenizer vocab.json")
+    p.add_argument(
+        "--vocab",
+        "--tokenizer",
+        default=DEFAULT_TOKENIZER_ID,
+        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+    )
     p.add_argument("--data-dir", type=Path, default=Path("data/processed-clean"))
     p.add_argument("--train-files", nargs="+", default=DEFAULT_TRAIN_FILES)
     p.add_argument("--val-file", default="s0-val.parquet")
     p.add_argument("--text-column", default="text")
+    p.add_argument(
+        "--data-format",
+        choices=["auto", "text", "packed"],
+        default="auto",
+        help="Input parquet format. auto detects offline packed-tokenized shards.",
+    )
     p.add_argument("--output", default="runs/staged-packed-pretrain")
     p.add_argument("--init-ckpt", help="Resume / initialize from a checkpoint")
     p.add_argument("--config", help="JSON file overriding default model config")
@@ -79,11 +96,26 @@ def parse_args():
     p.add_argument("--grad-clip", type=float, default=1.0)
 
     p.add_argument("--muon-lr", type=float, default=3e-4)
+    p.add_argument("--muon-momentum", type=float, default=0.95, help="Target Muon momentum after warmup")
+    p.add_argument(
+        "--muon-momentum-start",
+        type=float,
+        default=0.85,
+        help="Initial Muon momentum at step 0 (linearly ramped to --muon-momentum over --muon-momentum-warmup steps)",
+    )
+    p.add_argument(
+        "--muon-momentum-warmup",
+        type=int,
+        default=None,
+        help="Steps to ramp Muon momentum from start to target (defaults to --warmup if unset; pass 0 to disable)",
+    )
     p.add_argument("--muon-ns-steps", type=int, default=5)
     p.add_argument("--muon-adaptive", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--muon-adaptive-beta2", type=float, default=0.95)
     p.add_argument("--muon-adaptive-eps", type=float, default=1e-8)
     p.add_argument("--adamw-lr", type=float, default=3e-4)
+    p.add_argument("--adamw-beta1", type=float, default=0.8)
+    p.add_argument("--adamw-beta2", type=float, default=0.95)
     p.add_argument("--muon-wd", type=float, default=0.0)
     p.add_argument("--adamw-wd", type=float, default=0.1)
     p.add_argument("--adamw-independent-wd", action=argparse.BooleanOptionalAction, default=True)
@@ -93,10 +125,29 @@ def parse_args():
     p.add_argument("--lr-min-ratio", type=float, default=0.1)
     p.add_argument("--lr-stable-steps", type=int, default=0)
     p.add_argument("--qk-norm", action="store_true")
+    p.add_argument(
+        "--attention-window",
+        type=int,
+        default=256,
+        help="Sliding-window size for attention layers (W tokens). Pass 0 or a "
+        "negative value to disable; RWKV layers are unaffected.",
+    )
     p.add_argument("--z-loss-weight", type=float, default=1e-4)
     p.add_argument("--log-max-qk-logit", action="store_true")
 
     p.add_argument("--shuffle-buffer-size", type=int, default=10000)
+    p.add_argument(
+        "--packed-shuffle-buffer-size",
+        type=int,
+        default=1024,
+        help="Sample shuffle buffer for offline packed-tokenized shards.",
+    )
+    p.add_argument(
+        "--packed-read-batch-size",
+        type=int,
+        default=1024,
+        help="Parquet read batch size for offline packed-tokenized shards.",
+    )
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--no-amp", action="store_true")
@@ -115,6 +166,15 @@ def resolve_data_path(data_dir: Path, name: str | Path) -> Path:
     return path if path.is_absolute() else data_dir / path
 
 
+def resolve_data_format(path: Path, args: argparse.Namespace) -> str:
+    data_format = getattr(args, "data_format", "auto")
+    if data_format == "auto":
+        return "packed" if is_prepacked_parquet(path) else "text"
+    if data_format == "packed" and not is_prepacked_parquet(path):
+        raise ValueError(f"--data-format packed was set, but {path} is not a packed-tokenized parquet")
+    return data_format
+
+
 def make_loader(
     path: Path,
     tokenizer: ShoujenTokenizer,
@@ -125,15 +185,26 @@ def make_loader(
     device: torch.device,
     drop_last: bool,
 ) -> DataLoader:
-    dataset = PackedParquetPretrainDataset(
-        path,
-        tokenizer,
-        block_size=args.block_size,
-        text_column=args.text_column,
-        shuffle=shuffle,
-        shuffle_buffer_size=args.shuffle_buffer_size,
-        seed=seed,
-    )
+    data_format = resolve_data_format(path, args)
+    if data_format == "packed":
+        dataset = PrepackedParquetPretrainDataset(
+            path,
+            block_size=args.block_size,
+            shuffle=shuffle,
+            shuffle_buffer_size=getattr(args, "packed_shuffle_buffer_size", 1024),
+            seed=seed,
+            read_batch_size=getattr(args, "packed_read_batch_size", 1024),
+        )
+    else:
+        dataset = PackedParquetPretrainDataset(
+            path,
+            tokenizer,
+            block_size=args.block_size,
+            text_column=args.text_column,
+            shuffle=shuffle,
+            shuffle_buffer_size=args.shuffle_buffer_size,
+            seed=seed,
+        )
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -364,6 +435,11 @@ def main():
     print(f"device={device} amp={amp_dtype}", flush=True)
     print("train stages: " + " -> ".join(p.name for p in train_paths), flush=True)
     print(f"validation: {val_path.name}", flush=True)
+    print(
+        "data formats: "
+        + ", ".join(f"{p.name}={resolve_data_format(p, args)}" for p in [*train_paths, val_path]),
+        flush=True,
+    )
 
     tokenizer = ShoujenTokenizer.load(args.vocab)
     config = build_config(args, tokenizer)
@@ -377,18 +453,21 @@ def main():
     muon, adamw = build_optimizers(
         model,
         muon_lr=args.muon_lr,
+        muon_momentum=args.muon_momentum,
         muon_ns_steps=args.muon_ns_steps,
         muon_wd=args.muon_wd,
         muon_adaptive=args.muon_adaptive,
         muon_adaptive_beta2=args.muon_adaptive_beta2,
         muon_adaptive_eps=args.muon_adaptive_eps,
         adamw_lr=args.adamw_lr,
+        adamw_betas=(args.adamw_beta1, args.adamw_beta2),
         adamw_wd=args.adamw_wd,
         adamw_embed_wd=args.adamw_embed_wd if args.adamw_independent_wd else None,
         adamw_foreach=True if args.adamw_foreach else None,
     )
     base_muon_lrs = [g["lr"] for g in muon.param_groups]
     base_adamw_lrs = [g["lr"] for g in adamw.param_groups]
+    muon_mom_warmup = args.warmup if args.muon_momentum_warmup is None else args.muon_momentum_warmup
 
     global_step = 0
     if args.init_ckpt:
@@ -451,6 +530,13 @@ def main():
                 mult = lr_multiplier(args, global_step, schedule_steps)
                 set_optimizer_lr(muon, base_muon_lrs, mult)
                 set_optimizer_lr(adamw, base_adamw_lrs, mult)
+                mom_now = warmup_momentum(
+                    global_step,
+                    warmup=muon_mom_warmup,
+                    start=args.muon_momentum_start,
+                    end=args.muon_momentum,
+                )
+                set_optimizer_momentum(muon, mom_now)
 
             with make_autocast(device, amp_dtype):
                 outputs = model(

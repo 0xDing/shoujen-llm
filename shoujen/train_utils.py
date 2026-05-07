@@ -81,6 +81,25 @@ def set_optimizer_lr(opt: torch.optim.Optimizer, base_lrs: list[float], mult: fl
         g["lr"] = base * mult
 
 
+def warmup_momentum(step: int, *, warmup: int, start: float, end: float) -> float:
+    """Linear ramp from `start` to `end` over `warmup` steps, then `end`.
+
+    Used for Muon's momentum: early in training the momentum buffer is mostly
+    noise, so a lower initial momentum prevents amplifying that noise into the
+    Newton-Schulz update direction.
+    """
+    if warmup <= 0 or step >= warmup:
+        return end
+    progress = step / warmup
+    return start + (end - start) * progress
+
+
+def set_optimizer_momentum(opt: torch.optim.Optimizer, momentum: float) -> None:
+    for g in opt.param_groups:
+        if "momentum" in g:
+            g["momentum"] = momentum
+
+
 def save_checkpoint(
     path: str | Path,
     *,

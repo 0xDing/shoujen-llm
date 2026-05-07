@@ -28,7 +28,7 @@ from shoujen.data import build_packed_causal_mask
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
-from shoujen.tokenizer import ShoujenTokenizer
+from shoujen.tokenizer import DEFAULT_TOKENIZER_ID, ShoujenTokenizer
 from shoujen.train_utils import autocast_dtype, pick_device
 
 
@@ -58,7 +58,12 @@ def parse_bool_list(raw: str) -> list[bool]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--vocab", default="data/vocab.json")
+    p.add_argument(
+        "--vocab",
+        "--tokenizer",
+        default=DEFAULT_TOKENIZER_ID,
+        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+    )
     p.add_argument("--config", help="JSON file overriding default model config")
     p.add_argument("--output", type=Path, default=Path("runs/mps-batch-probe/results.json"))
     p.add_argument("--device", default=None)
