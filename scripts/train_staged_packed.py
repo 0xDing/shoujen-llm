@@ -83,6 +83,12 @@ def parse_args():
 
     p.add_argument("--batch-size", type=int, default=4, help="Packed sequences per micro-batch")
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    p.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Trade extra compute for lower activation memory.",
+    )
     p.add_argument("--block-size", type=int, default=2048)
     p.add_argument("--max-steps", type=int, default=0, help="Global cap; 0 means no cap")
     p.add_argument("--max-steps-per-stage", type=int, default=0, help="Per-stage cap; 0 means full shard")
@@ -447,6 +453,9 @@ def main():
     config.to_json(out_dir / "config.json")
 
     model = ShoujenLM(config).to(device)
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        print("gradient_checkpointing=enabled", flush=True)
     print(f"model: {model.num_parameters() / 1e6:.2f}M params", flush=True)
 
     muon, adamw = build_optimizers(
