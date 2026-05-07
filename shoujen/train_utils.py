@@ -62,8 +62,9 @@ def warmup_stable_decay_lr(
     warmup: int,
     max_steps: int,
     stable_steps: int = 0,
+    min_ratio: float = 0.0,
 ) -> float:
-    """Returns a warmup -> optional stable -> linear decay-to-zero multiplier."""
+    """Returns a warmup -> optional stable -> linear decay multiplier."""
     if step < warmup:
         return float(step + 1) / max(1, warmup)
 
@@ -73,7 +74,7 @@ def warmup_stable_decay_lr(
 
     progress = (step - decay_start) / max(1, max_steps - decay_start)
     progress = min(1.0, max(0.0, progress))
-    return 1.0 - progress
+    return min_ratio + (1.0 - min_ratio) * (1.0 - progress)
 
 
 def set_optimizer_lr(opt: torch.optim.Optimizer, base_lrs: list[float], mult: float) -> None:

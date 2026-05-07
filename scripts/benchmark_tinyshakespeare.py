@@ -238,6 +238,7 @@ def lr_multiplier(args: argparse.Namespace, step: int) -> float:
             warmup=args.warmup,
             max_steps=args.max_steps,
             stable_steps=args.lr_stable_steps,
+            min_ratio=args.lr_min_ratio,
         )
     return warmup_cosine_lr(
         step,
