@@ -1,8 +1,16 @@
 # Shoujen LLM
 
-A personal toy LLM project built on top of the `transformers` library. The goal: train a Chinese-first, CJK-tokenized chatbot from scratch on a single Apple M1 Ultra in a few hours.
+Shoujen is a personal, interest-driven toy LLM project: a small Chinese-first
+causal LM built on top of the `transformers` library. It combines a CJK-aware
+tokenizer, an RWKV7 + attention hybrid backbone, Moonshot-style block
+residuals, and Gemma4-style Per-Layer Embeddings (PLE) into a compact model
+that can still be trained from scratch on local hardware.
 
-This is the spiritual successor to [shoujen-rnn](https://github.com/0xDing/shoujen-rnn) — same goal of training a tiny language model on classical Chinese, now with a modern hybrid-recurrent transformer instead of a plain RNN.
+The goal is practical: make a small model that learns classical Chinese and
+modern instruction-following behavior without giving up too much context length
+or training throughput. It is the successor to
+[shoujen-rnn](https://github.com/0xDing/shoujen-rnn), now using a modern
+hybrid-recurrent transformer instead of a plain RNN.
 
 ## Training Data
 
@@ -53,7 +61,11 @@ keeps English-heavy spans more compact than the old pure character tokenizer.
 
 ## Model
 
-Text-only causal LM. Architecturally close to Qwen3.5, but with [RWKV7](https://github.com/blinkdl/rwkv-lm) in the recurrent slots instead of Gated DeltaNet.
+Text-only causal LM. Architecturally it starts from the Qwen3.5-Hybrid idea,
+then swaps the recurrent slots to [RWKV7](https://github.com/blinkdl/rwkv-lm)
+and adds two depth-scaling aids: Block Attention Residuals and Gemma4-style
+PLE. The result is a 114M-effective-parameter model whose stored parameter
+count is intentionally embedding-heavy.
 
 - `hidden_size = 512`
 - `num_hidden_layers = 24`
@@ -74,7 +86,7 @@ Text-only causal LM. Architecturally close to Qwen3.5, but with [RWKV7](https://
 
 ### Model design trade-offs
 
-**RWKV7 + Attention hybrid (3:1 ratio).**
+**RWKV7 + Attention Hybrid (3:1 Ratio).**
 - Pure attention is O(T²) and bandwidth-bound on the M1 Ultra; pure RWKV is O(T) but loses something on tasks that need precise long-range pointer-style retrieval. The 3:1 mix keeps most layers cheap (RWKV7 has linear cost in sequence length and tiny KV state at inference) while giving the model 6 full attention layers spread across depth for genuine random-access lookups. This is the same intuition behind Qwen3.5-Hybrid and Jamba; we just slot RWKV7 in where they use Gated DeltaNet, since RWKV7 is somewhat better-validated at small scale and has reference kernels readily available.
 - *Why RWKV7 specifically?* It supports a state-passing recurrence that converts cleanly to a closed-form parallel scan during training — so we get O(T) inference and parallel training without the engineering cost of writing a custom Triton kernel from scratch.
 
@@ -88,15 +100,22 @@ Text-only causal LM. Architecturally close to Qwen3.5, but with [RWKV7](https://
 - Standard pre-norm transformers exhibit "residual stream takeover" at depth — later layers struggle to overwrite low-frequency directions deposited early. Block residuals every 4 layers act as a periodic refresh that lets later attention blocks read a less-saturated stream. Cheap to add, measurably helps with deep-and-narrow shapes.
 
 **Gemma4-style Per-Layer Embeddings (PLE).**
-- The PLE table is packed as `vocab_size × num_hidden_layers × hidden_size_per_layer_input`. With the default 47,871-token CJK tokenizer and `24 × 256` per-token PLE slots, this adds 294.1M lookup parameters. Following Gemma's parameter-count convention, the effective count excludes embedding lookup tables, while the "with embeddings" count includes the tied token embedding and PLE table.
+- Every layer gets a token-identity side input instead of relying only on the
+  residual stream to remember the original token. The PLE table is packed as
+  `vocab_size × num_hidden_layers × hidden_size_per_layer_input`. With the
+  default 47,871-token CJK tokenizer and `24 × 256` per-token PLE slots, this
+  adds 294.1M lookup parameters. Following Gemma's parameter-count convention,
+  the effective count excludes embedding lookup tables, while the "with
+  embeddings" count includes the tied token embedding and PLE table.
 
 **Tied embeddings + RMSNorm + RoPE.**
 - Standard small-model defaults; RoPE because the attention layers need positional information that RWKV layers can't supply implicitly across the full window.
 
 ## Training
 
-Hardware:
-Apple M1 Ultra, PyTorch MPS.
+Hardware tested on:
+- Apple M1 Ultra, PyTorch MPS.
+- Nvidia RTX PRO 6000 WK, PyTorch CUDA.
 
 Optimizer:
 - Muon for hidden 2D matrices.
@@ -106,6 +125,42 @@ Training objectives:
 - Primary loss: next-token cross-entropy.
 - SFT stage: assistant-only loss (mask provided by the chat-template encoder).
 - Auxiliary loss: [Semantic Tube Prediction](https://github.com/galilai-group/llm-jepa#stp) is reserved for a future SFT path where message-local spans are available. It is not applied during packed pretraining, because random STP triples must not cross unrelated documents.
+
+### Real-Tokenizer Learning Signal
+
+For a quick architecture check, the benchmark script tokenizes TinyShakespeare
+with the real default CJK tokenizer and feeds the same sampled token windows to
+Shoujen and GPT-2 small. That keeps the production tokenizer, large vocabulary,
+and PLE table in the loop.
+
+```bash
+uv run python scripts/benchmark_tinyshakespeare.py \
+  --tokenizer-mode hf \
+  --models shoujen gpt2-small \
+  --data data/tinyshakespeare/input.txt \
+  --batch-size 2 \
+  --block-size 128 \
+  --max-steps 100 \
+  --eval-batches 4 \
+  --optimizer-mode same-adamw \
+  --adamw-lr 6e-4 \
+  --gpt2-lr 6e-4 \
+  --no-amp
+```
+
+On MPS, the 100-step run shows a stronger early loss drop for Shoujen:
+
+| model | parameter count | initial val | final val | delta |
+| --- | ---: | ---: | ---: | ---: |
+| Shoujen | 114.1M effective / 432.7M with embeddings | 10.855 | 5.297 | 5.558 |
+| GPT-2 small | 121.9M with embeddings | 10.932 | 6.525 | 4.406 |
+
+Both models use the same token stream and AdamW setup. The comparison is most
+useful as an early-learning signal under the tokenizer Shoujen is designed for:
+the hybrid + PLE architecture reaches lower validation loss in the first 100
+updates. Parameter count follows Gemma's convention: Shoujen is 114.1M
+effective parameters, while its 432.7M stored parameters are dominated by the
+294.1M PLE lookup table.
 
 ### Offline tokenized packed pretraining
 
@@ -243,3 +298,7 @@ parameters.
 - https://arxiv.org/abs/2602.22617
 - https://arxiv.org/abs/2502.16982
 - https://github.com/0xDing/shoujen-rnn — the RNN-era predecessor
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

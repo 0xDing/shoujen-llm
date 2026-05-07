@@ -30,6 +30,7 @@ from shoujen.config import ShoujenConfig
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
+from shoujen.tokenizer import DEFAULT_TOKENIZER_ID, ShoujenTokenizer
 from shoujen.train_utils import (
     autocast_dtype,
     pick_device,
@@ -47,6 +48,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", default="data/tinyshakespeare/input.txt")
     p.add_argument("--download-url", default=DATA_URL)
     p.add_argument("--out", default="runs/tinyshakespeare_compare/metrics.json")
+    p.add_argument(
+        "--tokenizer-mode",
+        choices=["char", "hf"],
+        default="char",
+        help="Use the original character vocabulary or a Hugging Face tokenizer.",
+    )
+    p.add_argument(
+        "--tokenizer",
+        default=DEFAULT_TOKENIZER_ID,
+        help="Hugging Face tokenizer id/URL or saved tokenizer directory when --tokenizer-mode=hf.",
+    )
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--batch-size", type=int, default=4)
@@ -96,6 +108,12 @@ def encode_text(text: str) -> tuple[torch.Tensor, dict[str, int], list[str]]:
     stoi = {ch: i + 2 for i, ch in enumerate(chars)}
     ids = torch.tensor([stoi[ch] for ch in text], dtype=torch.long)
     return ids, stoi, chars
+
+
+def encode_text_hf(text: str, tokenizer_source: str) -> tuple[torch.Tensor, int, str]:
+    tokenizer = ShoujenTokenizer.load(tokenizer_source)
+    ids = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+    return ids, tokenizer.vocab_size, tokenizer_source
 
 
 def make_starts(
@@ -411,8 +429,13 @@ def main() -> None:
     else:
         amp_dtype = autocast_dtype(device)
     text = ensure_data(Path(args.data), args.download_url)
-    ids, stoi, chars = encode_text(text)
-    vocab_size = len(stoi) + 2
+    if args.tokenizer_mode == "hf":
+        ids, vocab_size, tokenizer_label = encode_text_hf(text, args.tokenizer)
+        tokenizer_summary = f"tokenizer={tokenizer_label}"
+    else:
+        ids, stoi, chars = encode_text(text)
+        vocab_size = len(stoi) + 2
+        tokenizer_summary = f"chars={len(chars)}"
 
     split = int(0.9 * len(ids))
     train_data = ids[:split]
@@ -435,7 +458,7 @@ def main() -> None:
     )
 
     print(
-        f"device={device} amp={amp_dtype} chars={len(chars)} vocab={vocab_size} "
+        f"device={device} amp={amp_dtype} {tokenizer_summary} vocab={vocab_size} "
         f"tokens={len(ids)} batch={args.batch_size} block={args.block_size} "
         f"steps={args.max_steps} optimizer_mode={args.optimizer_mode}",
         flush=True,
@@ -496,7 +519,8 @@ def main() -> None:
                 "args": vars(args),
                 "device": str(device),
                 "amp_dtype": str(amp_dtype),
-                "num_chars": len(chars),
+                "tokenizer_mode": args.tokenizer_mode,
+                "tokenizer": args.tokenizer if args.tokenizer_mode == "hf" else "char",
                 "vocab_size": vocab_size,
                 "num_tokens": len(ids),
                 "results": results,
