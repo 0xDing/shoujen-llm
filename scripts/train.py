@@ -53,10 +53,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["pretrain", "sft"], required=True)
     p.add_argument(
-        "--vocab",
         "--tokenizer",
         default=DEFAULT_TOKENIZER_ID,
-        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+        help="Hugging Face tokenizer id/URL or saved tokenizer directory",
     )
     p.add_argument("--corpus", help="Path to pretraining corpus (jsonl/dir/.txt)")
     p.add_argument("--sft", help="Path to SFT jsonl")
@@ -178,7 +177,7 @@ def main():
     amp_dtype = None if args.no_amp else autocast_dtype(device)
     print(f"device={device} amp={amp_dtype}", flush=True)
 
-    tokenizer = ShoujenTokenizer.load(args.vocab)
+    tokenizer = ShoujenTokenizer.load(args.tokenizer)
     config = build_config(args, tokenizer)
     config.to_json(out / "config.json")
 

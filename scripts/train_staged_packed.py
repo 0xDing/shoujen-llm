@@ -63,10 +63,9 @@ DEFAULT_TRAIN_FILES = [
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
-        "--vocab",
         "--tokenizer",
         default=DEFAULT_TOKENIZER_ID,
-        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+        help="Hugging Face tokenizer id/URL or saved tokenizer directory",
     )
     p.add_argument("--data-dir", type=Path, default=Path("data/processed-clean"))
     p.add_argument("--train-files", nargs="+", default=DEFAULT_TRAIN_FILES)
@@ -441,7 +440,7 @@ def main():
         flush=True,
     )
 
-    tokenizer = ShoujenTokenizer.load(args.vocab)
+    tokenizer = ShoujenTokenizer.load(args.tokenizer)
     config = build_config(args, tokenizer)
     if args.qk_norm:
         config.qk_norm = True

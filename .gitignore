@@ -10,6 +10,5 @@ wheels/
 .venv
 
 data/*
-!data/vocab.json
 runs
 .pytest_cache

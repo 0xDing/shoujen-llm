@@ -46,10 +46,9 @@ _WORKER_TOKENIZER: ShoujenTokenizer | None = None
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--vocab",
         "--tokenizer",
         default=DEFAULT_TOKENIZER_ID,
-        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+        help="Hugging Face tokenizer id/URL or saved tokenizer directory",
     )
     ap.add_argument("--source-dir", type=Path, default=Path("data/processed-clean"))
     ap.add_argument("--out-dir", type=Path, default=Path("data/processed-packed"))
@@ -268,7 +267,7 @@ def process_file(
 
     writer = PackedWriter(
         out_path,
-        schema_for(args.block_size, tokenizer, args.vocab, src_path),
+        schema_for(args.block_size, tokenizer, args.tokenizer, src_path),
         block_size=args.block_size,
         write_batch_size=args.write_batch_size,
         overwrite=args.overwrite,
@@ -380,10 +379,10 @@ def main() -> None:
     if args.read_batch_size <= 0 or args.write_batch_size <= 0 or args.tokenize_batch_size <= 0:
         raise SystemExit("--read-batch-size, --write-batch-size and --tokenize-batch-size must be positive")
 
-    tokenizer = ShoujenTokenizer.load(args.vocab)
+    tokenizer = ShoujenTokenizer.load(args.tokenizer)
     tokenizer_workers = effective_tokenizer_workers(args.tokenizer_workers)
     print(
-        f"tokenizer={args.vocab} vocab_size={tokenizer.vocab_size} block_size={args.block_size} "
+        f"tokenizer={args.tokenizer} vocab_size={tokenizer.vocab_size} block_size={args.block_size} "
         f"tokenizer_workers={tokenizer_workers} tokenize_batch_size={args.tokenize_batch_size}",
         flush=True,
     )
@@ -393,7 +392,7 @@ def main() -> None:
         else ProcessPoolExecutor(
             max_workers=tokenizer_workers,
             initializer=init_tokenizer_worker,
-            initargs=(args.vocab,),
+            initargs=(args.tokenizer,),
         )
     )
     with executor_context as executor:

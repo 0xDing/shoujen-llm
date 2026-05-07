@@ -59,10 +59,9 @@ def parse_bool_list(raw: str) -> list[bool]:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument(
-        "--vocab",
         "--tokenizer",
         default=DEFAULT_TOKENIZER_ID,
-        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+        help="Hugging Face tokenizer id/URL or saved tokenizer directory",
     )
     p.add_argument("--config", help="JSON file overriding default model config")
     p.add_argument("--output", type=Path, default=Path("runs/mps-batch-probe/results.json"))
@@ -332,7 +331,7 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
     device = torch.device(args.device) if args.device else pick_device()
     amp_dtype = None if args.no_amp else autocast_dtype(device)
-    tokenizer = ShoujenTokenizer.load(args.vocab)
+    tokenizer = ShoujenTokenizer.load(args.tokenizer)
 
     cases = [
         (batch_size, checkpointing, accum)

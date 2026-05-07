@@ -30,10 +30,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
     p.add_argument(
-        "--vocab",
         "--tokenizer",
         default=DEFAULT_TOKENIZER_ID,
-        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+        help="Hugging Face tokenizer id/URL or saved tokenizer directory",
     )
     p.add_argument("--prompt", default=None)
     p.add_argument("--chat", action="store_true")
@@ -90,7 +89,7 @@ def main():
     device = torch.device(args.device) if args.device else pick_device()
     print(f"device={device}", flush=True)
 
-    tokenizer = ShoujenTokenizer.load(args.vocab)
+    tokenizer = ShoujenTokenizer.load(args.tokenizer)
     model, _ = load_model(args.ckpt, device)
     print(f"loaded {args.ckpt} ({model.num_parameters() / 1e6:.2f}M params)", flush=True)
 

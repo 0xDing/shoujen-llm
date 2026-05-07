@@ -1,6 +1,6 @@
 # Shoujen LLM
 
-A personal toy LLM project built on top of the `transformers` library. The goal: train a Chinese-first, char-level chatbot from scratch on a single Apple M1 Ultra in a few hours.
+A personal toy LLM project built on top of the `transformers` library. The goal: train a Chinese-first, CJK-tokenized chatbot from scratch on a single Apple M1 Ultra in a few hours.
 
 This is the spiritual successor to [shoujen-rnn](https://github.com/0xDing/shoujen-rnn) — same goal of training a tiny language model on classical Chinese, now with a modern hybrid-recurrent transformer instead of a plain RNN.
 
@@ -16,28 +16,36 @@ The mix is intentional: classical Chinese gives the model a stylistic and semant
 
 ## Tokenizer
 
-The default tokenizer is loaded directly from
-[`AgentBull/CJK-Tokenizer`](https://huggingface.co/AgentBull/CJK-Tokenizer):
+The default tokenizer is
+[`AgentBull/CJK-Tokenizer`](https://huggingface.co/AgentBull/CJK-Tokenizer),
+loaded through the project wrapper:
 
 ```python
-from transformers import AutoTokenizer
+from shoujen.tokenizer import ShoujenTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("AgentBull/CJK-Tokenizer")
+tokenizer = ShoujenTokenizer.load()
 ```
 
 It is a LLaMA tokenizer extended with single-token CJK characters. CJK text is
 mostly character-level, while Latin text, punctuation, and other scripts keep
 the original LLaMA subword behavior. Shoujen adds only the chat boundary tokens
 `<im_start>` and `<im_end>` at load time; there is no dedicated pad token in
-the default tokenizer path. Packed pretraining uses EOS-separated chunks.
+the default tokenizer path, so padding-only code falls back to EOS by position.
+
+All training and inference scripts accept `--tokenizer` with a Hugging Face
+tokenizer id, Hugging Face URL, or saved tokenizer directory. The old
+`data/vocab.json` character-tokenizer path has been removed; passing a single
+local vocab JSON file is an error.
 
 ### Tokenizer design trade-offs
 
-**Why character-level instead of BPE / SentencePiece?**
+**Why CJK character tokens instead of a locally trained BPE / SentencePiece?**
 
 - *For classical Chinese, characters already are the morphemes.* A single 字 is a meaningful unit, often a whole word in pre-Tang prose. Keeping CJK characters atomic avoids merge rules biased toward modern high-frequency phrases.
 - *Cross-register robustness.* The same model needs to read 《左傳》 and a modern Wikipedia paragraph in the same forward pass. CJK character tokens keep the core unit stable across registers, while LLaMA subwords keep English and code from exploding to byte- or character-level lengths.
-- *No local tokenizer build step.* Training and inference load the same published tokenizer id, so `data/vocab.json` is no longer required for the default path.
+- *No local tokenizer build step.* Training and inference load the same
+  published tokenizer id, so the repo no longer carries or builds
+  `data/vocab.json`.
 
 **The cost** is that Chinese text is still close to character length. That is
 acceptable for this Chinese-dominant model, and the inherited LLaMA tokenizer
@@ -104,10 +112,26 @@ uv run python scripts/build_packed_tokenized_corpus.py \
   --source-dir data/processed-clean \
   --out-dir data/processed-packed \
   --block-size 2048 \
+  --tokenizer AgentBull/CJK-Tokenizer \
   --tokenizer-workers 8
 ```
 
-Then train from the preprocessed shards:
+The builder treats each source parquet row as an independent document, appends
+EOS to that document, and emits fixed-size parquet rows containing
+`block_size + 1` aligned arrays:
+
+- `token_ids`: full next-token windows
+- `seq_ids`: packed document ids, normalized per output row
+- `position_ids`: per-document token positions, reset at document starts
+- `sequence_starts`: reset flags for recurrent state
+
+Rows may contain multiple documents, but training remains boundary-safe:
+attention is masked to tokens with the same `seq_id`, RWKV state is reset at
+`sequence_starts`, and labels that would predict across documents are replaced
+with `-100`. The final partial tail of each shard is dropped unless it reaches
+`block_size + 1` tokens.
+
+Then train from the prepacked shards:
 
 ```bash
 uv run python scripts/train_staged_packed.py \
@@ -116,12 +140,15 @@ uv run python scripts/train_staged_packed.py \
   --block-size 2048
 ```
 
-`--data-format auto` also detects these shards from parquet columns, but
-passing `packed` fails fast if the wrong input is provided.
+`--data-format auto` detects these shards from the parquet columns and switches
+to the offline reader. Passing `--data-format packed` fails fast if a shard is
+missing the required packed columns or its metadata block size does not match
+the requested `--block-size`.
 
 ### Trainer-based packed pretraining
 
-The staged parquet pretraining path also has a Transformers `Trainer` entrypoint:
+The staged parquet pretraining path also has a Transformers `Trainer` entrypoint
+that streams text parquet rows and packs them online:
 
 ```bash
 uv run python scripts/train_trainer_staged_packed.py \

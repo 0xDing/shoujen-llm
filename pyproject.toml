@@ -1,7 +1,7 @@
 [project]
 name = "shoujen-llm"
 version = "0.1.0"
-description = "A toy char-level Chinese-first chatbot LLM with RWKV7+Attention hybrid"
+description = "A toy CJK-tokenized Chinese-first chatbot LLM with RWKV7+Attention hybrid"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

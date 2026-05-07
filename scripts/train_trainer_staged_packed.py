@@ -76,10 +76,9 @@ class StagedPackedParquetDataset(IterableDataset):
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument(
-        "--vocab",
         "--tokenizer",
         default=DEFAULT_TOKENIZER_ID,
-        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+        help="Hugging Face tokenizer id/URL or saved tokenizer directory",
     )
     p.add_argument("--data-dir", type=Path, default=Path("data/processed-clean"))
     p.add_argument("--train-files", nargs="+", default=DEFAULT_TRAIN_FILES)
@@ -259,7 +258,7 @@ def main() -> None:
     device = torch.device(args.device) if args.device else pick_device()
     amp_dtype = None if args.no_amp else autocast_dtype(device)
 
-    tokenizer = ShoujenTokenizer.load(args.vocab)
+    tokenizer = ShoujenTokenizer.load(args.tokenizer)
     config = build_config(args, tokenizer)
     if args.qk_norm:
         config.qk_norm = True

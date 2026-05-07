@@ -139,10 +139,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
 
     p.add_argument(
-        "--vocab",
         "--tokenizer",
         default=DEFAULT_TOKENIZER_ID,
-        help="Hugging Face tokenizer id/URL or legacy local vocab.json",
+        help="Hugging Face tokenizer id/URL or saved tokenizer directory",
     )
     p.add_argument("--data-dir", type=Path, default=Path("data/processed-clean"))
     p.add_argument("--train-files", nargs="+", default=DEFAULT_TRAIN_FILES)
@@ -381,7 +380,7 @@ def make_trial_train_args(
 ) -> argparse.Namespace:
     schedule_steps = max(1, search_args.trial_steps)
     return argparse.Namespace(
-        vocab=search_args.vocab,
+        tokenizer=search_args.tokenizer,
         data_dir=search_args.data_dir,
         train_files=search_args.train_files,
         val_file=search_args.val_file,
@@ -1009,8 +1008,8 @@ def build_formal_command(args: argparse.Namespace, params: dict[str, Any]) -> st
         "run",
         "python",
         "scripts/train_staged_packed.py",
-        "--vocab",
-        str(args.vocab),
+        "--tokenizer",
+        str(args.tokenizer),
         "--data-dir",
         str(args.data_dir),
         "--train-files",
@@ -1274,7 +1273,7 @@ def main() -> None:
 
     device = torch.device(args.device) if args.device else pick_device()
     amp_dtype = None if args.no_amp else autocast_dtype(device)
-    tokenizer = ShoujenTokenizer.load(args.vocab)
+    tokenizer = ShoujenTokenizer.load(args.tokenizer)
 
     print(
         f"device={device} amp={amp_dtype} backend={args.backend} "
