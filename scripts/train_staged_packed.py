@@ -55,6 +55,7 @@ from shoujen.optim import build_optimizers
 from shoujen.tokenizer import DEFAULT_TOKENIZER_ID, ShoujenTokenizer
 from shoujen.train_utils import (
     autocast_dtype,
+    filter_optimizer_state_for_param_shapes,
     load_checkpoint,
     move_tensor_to_device,
     pick_device,
@@ -761,12 +762,32 @@ def main():
 
     global_step = 0
     if args.init_ckpt:
-        state = load_checkpoint(args.init_ckpt, model, map_location=device)
+        state = load_checkpoint(args.init_ckpt, model, map_location=device, allow_appended_vocab=True)
+        appended_vocab = state.get("_shoujen_appended_vocab_keys") or []
+        if appended_vocab:
+            details = ", ".join(
+                f"{item['name']} {item['checkpoint_shape']} -> {item['model_shape']}"
+                for item in appended_vocab
+            )
+            print_main(
+                dist_ctx,
+                f"loaded ckpt with appended tokenizer rows; initialized new rows for {details}",
+                flush=True,
+            )
         if "muon" in state:
             muon.load_state_dict(state["muon"])
         if "adamw" in state:
             try:
-                adamw.load_state_dict(state["adamw"])
+                adamw_state = state["adamw"]
+                if appended_vocab:
+                    adamw_state, skipped = filter_optimizer_state_for_param_shapes(adamw, adamw_state)
+                    if skipped:
+                        print_main(
+                            dist_ctx,
+                            f"WARN: skipped AdamW state for {len(skipped)} resized parameter(s).",
+                            flush=True,
+                        )
+                adamw.load_state_dict(adamw_state)
             except ValueError:
                 print_main(dist_ctx, "WARN: AdamW state shape/group mismatch - skipping.", flush=True)
         global_step = int(state.get("step", 0))

@@ -127,7 +127,97 @@ def save_checkpoint(
     torch.save(state, path)
 
 
-def load_checkpoint(path: str | Path, model: nn.Module, *, map_location="cpu") -> dict:
+_VOCAB_RESIZABLE_KEYS = {
+    "model.embed_tokens.weight",
+    "model.embed_tokens_per_layer.weight",
+    "lm_head.weight",
+}
+
+
+def _load_state_dict_with_appended_vocab(
+    model: nn.Module,
+    checkpoint_model_state: dict[str, torch.Tensor],
+) -> tuple[list[dict[str, Any]], dict[str, torch.Tensor]]:
+    current_model_state = model.state_dict()
+    patched_model_state = dict(checkpoint_model_state)
+    resized: list[dict[str, Any]] = []
+
+    for name in _VOCAB_RESIZABLE_KEYS:
+        saved = checkpoint_model_state.get(name)
+        current = current_model_state.get(name)
+        if saved is None or current is None or saved.shape == current.shape:
+            continue
+        if saved.ndim != current.ndim or saved.shape[1:] != current.shape[1:]:
+            continue
+        if saved.shape[0] > current.shape[0]:
+            continue
+
+        patched = current.detach().clone()
+        patched[: saved.shape[0]].copy_(saved.to(device=patched.device, dtype=patched.dtype))
+        patched_model_state[name] = patched
+        resized.append(
+            {
+                "name": name,
+                "checkpoint_shape": tuple(saved.shape),
+                "model_shape": tuple(current.shape),
+                "new_rows": int(current.shape[0] - saved.shape[0]),
+            }
+        )
+
+    return resized, patched_model_state
+
+
+def load_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    *,
+    map_location="cpu",
+    allow_appended_vocab: bool = False,
+) -> dict:
     state = torch.load(path, map_location=map_location, weights_only=False)
-    model.load_state_dict(state["model"])
+    model_state = state["model"]
+    if allow_appended_vocab:
+        resized, model_state = _load_state_dict_with_appended_vocab(model, model_state)
+        state["_shoujen_appended_vocab_keys"] = resized
+    model.load_state_dict(model_state)
     return state
+
+
+def filter_optimizer_state_for_param_shapes(
+    optimizer: torch.optim.Optimizer,
+    optimizer_state: dict,
+) -> tuple[dict, list[int]]:
+    """Drop optimizer state entries whose tensor shapes no longer match params.
+
+    This is used when resuming a checkpoint after appending tokenizer rows. The
+    model weights can copy old rows into a larger embedding matrix, but AdamW's
+    moment buffers for those matrices still have the old row count and must be
+    reinitialized.
+    """
+    saved_groups = optimizer_state.get("param_groups", [])
+    saved_param_ids = [pid for group in saved_groups for pid in group.get("params", [])]
+    current_params = [p for group in optimizer.param_groups for p in group["params"]]
+    if len(saved_param_ids) != len(current_params):
+        return optimizer_state, []
+
+    skipped: list[int] = []
+    filtered_state = {}
+    saved_state = optimizer_state.get("state", {})
+    for saved_pid, param in zip(saved_param_ids, current_params):
+        param_state = saved_state.get(saved_pid)
+        if param_state is None:
+            continue
+        shape_mismatch = False
+        for value in param_state.values():
+            if torch.is_tensor(value) and value.ndim > 0 and tuple(value.shape) != tuple(param.shape):
+                shape_mismatch = True
+                break
+        if shape_mismatch:
+            skipped.append(saved_pid)
+        else:
+            filtered_state[saved_pid] = param_state
+
+    filtered = dict(optimizer_state)
+    filtered["state"] = filtered_state
+    filtered["param_groups"] = [dict(group) for group in saved_groups]
+    return filtered, skipped
