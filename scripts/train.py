@@ -1,20 +1,13 @@
-"""Train Shoujen-LM (pretraining or SFT).
+"""Train Shoujen-LM pretraining.
 
 Examples:
-    # Pretraining
     python scripts/train.py \
-        --mode pretrain \
         --corpus data/corpus.jsonl \
         --output runs/pretrain \
         --batch-size 4 --block-size 1024 --max-steps 20000
 
-    # SFT (initialise from a pretraining checkpoint)
-    python scripts/train.py \
-        --mode sft \
-        --sft data/sft.jsonl \
-        --init-ckpt runs/pretrain/last.pt \
-        --output runs/sft \
-        --batch-size 4 --block-size 1024 --max-steps 5000
+Packed SFT uses scripts/build_packed_tokenized_sft.py and
+scripts/train_sft_packed.py.
 """
 from __future__ import annotations
 
@@ -30,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from shoujen.config import ShoujenConfig
-from shoujen.data import PackedPretrainDataset, SFTDataset, collate
+from shoujen.data import PackedPretrainDataset, collate
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
@@ -51,14 +44,13 @@ from shoujen.train_utils import (
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["pretrain", "sft"], required=True)
+    p.add_argument("--mode", choices=["pretrain"], default="pretrain", help=argparse.SUPPRESS)
     p.add_argument(
         "--tokenizer",
         default=DEFAULT_TOKENIZER_ID,
         help="Hugging Face tokenizer id/URL or saved tokenizer directory",
     )
     p.add_argument("--corpus", help="Path to pretraining corpus (jsonl/dir/.txt)")
-    p.add_argument("--sft", help="Path to SFT jsonl")
     p.add_argument("--cache", help="Path to pretokenized memmap (pretraining only)")
     p.add_argument("--output", required=True)
     p.add_argument("--init-ckpt", help="Resume / initialize from a checkpoint")
@@ -132,6 +124,8 @@ def build_config(args, tokenizer: ShoujenTokenizer) -> ShoujenConfig:
     cfg.eos_token_id = tokenizer.eos_id
     cfg.im_start_token_id = tokenizer.im_start_id
     cfg.im_end_token_id = tokenizer.im_end_id
+    cfg.think_start_token_id = tokenizer.think_start_id
+    cfg.think_end_token_id = tokenizer.think_end_id
     cfg.max_seq_len = max(cfg.max_seq_len, args.block_size)
     if getattr(args, "qk_norm", False):
         cfg.qk_norm = True
@@ -158,15 +152,11 @@ def lr_multiplier(args, step: int, max_steps: int) -> float:
 
 
 def build_dataset(args, tokenizer):
-    if args.mode == "pretrain":
-        if not args.corpus:
-            raise SystemExit("--corpus is required for pretraining")
-        return PackedPretrainDataset(
-            args.corpus, tokenizer, block_size=args.block_size, cache_path=args.cache
-        )
-    if not args.sft:
-        raise SystemExit("--sft is required for sft mode")
-    return SFTDataset(args.sft, tokenizer, block_size=args.block_size)
+    if not args.corpus:
+        raise SystemExit("--corpus is required for pretraining")
+    return PackedPretrainDataset(
+        args.corpus, tokenizer, block_size=args.block_size, cache_path=args.cache
+    )
 
 
 def main():
@@ -209,14 +199,14 @@ def main():
     start_step = 0
     if args.init_ckpt:
         state = load_checkpoint(args.init_ckpt, model, map_location=device)
-        if args.mode == "pretrain" and "muon" in state:
+        if "muon" in state:
             muon.load_state_dict(state["muon"])
-        if args.mode == "pretrain" and "adamw" in state:
+        if "adamw" in state:
             try:
                 adamw.load_state_dict(state["adamw"])
             except ValueError:
                 print("WARN: AdamW state shape/group mismatch — skipping.")
-        start_step = state.get("step", 0) if args.mode == "pretrain" else 0
+        start_step = state.get("step", 0)
         print(f"loaded ckpt {args.init_ckpt} step={start_step}", flush=True)
 
     dataset = build_dataset(args, tokenizer)

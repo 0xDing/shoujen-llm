@@ -84,14 +84,16 @@ class SemanticTubePredictionLoss(nn.Module):
         hidden: torch.Tensor,
         spans: torch.Tensor | None = None,
         *,
+        span_mask: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Compute STP over continuous spans.
 
         `hidden`: (B, T, D), usually the final layer hidden states.
-        `spans`: optional (B, 2) integer tensor of [start, end) bounds in
-            hidden-state positions. Future SFT code should pass assistant or
-            natural-content spans here. If omitted, the full sequence is used.
+        `spans`: optional (B, 2) or (B, S, 2) integer tensor of [start, end)
+            bounds in hidden-state positions. SFT should pass assistant-answer
+            spans here, excluding unrelated packed content and scratch space.
+        `span_mask`: optional (B, S) bool tensor for padded multi-span inputs.
 
         Returns scalar loss (zero if no active positions).
         """
@@ -99,37 +101,61 @@ class SemanticTubePredictionLoss(nn.Module):
         del D
 
         if spans is None:
-            spans = torch.tensor([[0, T]], device=hidden.device).expand(B, 2)
-        elif spans.shape != (B, 2):
-            raise ValueError(f"spans must have shape {(B, 2)}, got {tuple(spans.shape)}")
+            spans = torch.tensor([[[0, T]]], device=hidden.device).expand(B, 1, 2)
+            span_mask = torch.ones((B, 1), dtype=torch.bool, device=hidden.device)
+        elif spans.ndim == 2:
+            if spans.shape != (B, 2):
+                raise ValueError(f"spans must have shape {(B, 2)}, got {tuple(spans.shape)}")
+            spans = spans[:, None, :]
+            if span_mask is None:
+                span_mask = torch.ones((B, 1), dtype=torch.bool, device=hidden.device)
+        elif spans.ndim == 3:
+            if spans.shape[0] != B or spans.shape[2] != 2:
+                raise ValueError(
+                    f"spans must have shape {(B, 'S', 2)}, got {tuple(spans.shape)}"
+                )
+            if span_mask is None:
+                span_mask = torch.ones(spans.shape[:2], dtype=torch.bool, device=hidden.device)
+            elif span_mask.shape != spans.shape[:2]:
+                raise ValueError(
+                    f"span_mask must have shape {tuple(spans.shape[:2])}, "
+                    f"got {tuple(span_mask.shape)}"
+                )
+        else:
+            raise ValueError(f"spans must be rank 2 or 3, got rank {spans.ndim}")
+        spans = spans.to(device=hidden.device)
+        span_mask = span_mask.to(device=hidden.device, dtype=torch.bool)
 
         losses: list[torch.Tensor] = []
         for i in range(B):
-            start = max(0, min(T, int(spans[i, 0].item())))
-            end = max(start, min(T, int(spans[i, 1].item())))
-            if end - start < 3:
-                continue
+            for span_idx in range(spans.shape[1]):
+                if not bool(span_mask[i, span_idx].item()):
+                    continue
+                start = max(0, min(T, int(spans[i, span_idx, 0].item())))
+                end = max(start, min(T, int(spans[i, span_idx, 1].item())))
+                if end - start < 3:
+                    continue
 
-            for _ in range(self.samples_per_sequence):
-                max_end = end
-                if self.max_width is not None:
-                    # Sample s first, then cap t so that t - s <= max_width.
-                    latest_s = max(start + 1, end - 2)
-                    s = _randint(start, latest_s, generator=generator)
-                    max_end = min(end, s + self.max_width + 1)
-                    if max_end - s < 3:
-                        continue
-                else:
-                    s = _randint(start, end - 2, generator=generator)
+                for _ in range(self.samples_per_sequence):
+                    max_end = end
+                    if self.max_width is not None:
+                        # Sample s first, then cap t so that t - s <= max_width.
+                        latest_s = max(start + 1, end - 2)
+                        s = _randint(start, latest_s, generator=generator)
+                        max_end = min(end, s + self.max_width + 1)
+                        if max_end - s < 3:
+                            continue
+                    else:
+                        s = _randint(start, end - 2, generator=generator)
 
-                r = _randint(s + 1, max_end - 1, generator=generator)
-                t = _randint(r + 1, max_end, generator=generator)
+                    r = _randint(s + 1, max_end - 1, generator=generator)
+                    t = _randint(r + 1, max_end, generator=generator)
 
-                future = hidden[i, t] - hidden[i, r]
-                past = hidden[i, r] - hidden[i, s]
-                losses.append(
-                    1.0 - F.cosine_similarity(future.float(), past.float(), dim=0)
-                )
+                    future = hidden[i, t] - hidden[i, r]
+                    past = hidden[i, r] - hidden[i, s]
+                    losses.append(
+                        1.0 - F.cosine_similarity(future.float(), past.float(), dim=0)
+                    )
 
         if not losses:
             return hidden.new_zeros(())

@@ -20,7 +20,10 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 DEFAULT_TOKENIZER_ID = "AgentBull/CJK-Tokenizer"
 IM_START_TOKEN = "<im_start>"
 IM_END_TOKEN = "<im_end>"
-PROJECT_ADDITIONAL_SPECIAL_TOKENS = [IM_START_TOKEN, IM_END_TOKEN]
+THINK_START_TOKEN = "<think>"
+THINK_END_TOKEN = "</think>"
+SPECIAL_TOKENS = [IM_START_TOKEN, IM_END_TOKEN, THINK_START_TOKEN, THINK_END_TOKEN]
+PROJECT_ADDITIONAL_SPECIAL_TOKENS = SPECIAL_TOKENS
 
 
 def _normalize_hf_tokenizer_source(source: str) -> str:
@@ -37,6 +40,31 @@ def _token_missing(tokenizer: PreTrainedTokenizerBase, token: str) -> bool:
     return token_id is None or (
         tokenizer.unk_token_id is not None and token_id == tokenizer.unk_token_id
     )
+
+
+def _special_token_strings(tokenizer: PreTrainedTokenizerBase) -> set[str]:
+    tokens: set[str] = set()
+    for attr in ("all_special_tokens", "extra_special_tokens", "additional_special_tokens"):
+        for token in getattr(tokenizer, attr, []) or []:
+            tokens.add(str(token))
+
+    special_tokens_map = getattr(tokenizer, "special_tokens_map", {}) or {}
+    for value in special_tokens_map.values():
+        if isinstance(value, (list, tuple)):
+            tokens.update(str(token) for token in value)
+        else:
+            tokens.add(str(value))
+    return tokens
+
+
+def _extra_special_token_strings(tokenizer: PreTrainedTokenizerBase) -> list[str]:
+    tokens: list[str] = []
+    for attr in ("extra_special_tokens", "additional_special_tokens"):
+        for token in getattr(tokenizer, attr, []) or []:
+            token = str(token)
+            if token not in tokens:
+                tokens.append(token)
+    return tokens
 
 
 class ShoujenTokenizer:
@@ -56,21 +84,22 @@ class ShoujenTokenizer:
 
     def _ensure_project_tokens(self) -> None:
         tok = self.hf_tokenizer
-        missing_chat_tokens = [
+        existing_special_tokens = _special_token_strings(tok)
+        missing_special_tokens = [
             token
             for token in PROJECT_ADDITIONAL_SPECIAL_TOKENS
-            if _token_missing(tok, token)
+            if token not in existing_special_tokens
         ]
-        if missing_chat_tokens:
+        if missing_special_tokens:
             try:
                 tok.add_special_tokens(
-                    {"additional_special_tokens": missing_chat_tokens},
+                    {"additional_special_tokens": missing_special_tokens},
                     replace_additional_special_tokens=False,
                 )
             except TypeError:
-                existing = list(getattr(tok, "additional_special_tokens", []) or [])
+                existing_extra_tokens = _extra_special_token_strings(tok)
                 tok.add_special_tokens(
-                    {"additional_special_tokens": existing + missing_chat_tokens}
+                    {"additional_special_tokens": existing_extra_tokens + missing_special_tokens}
                 )
 
         missing = [
@@ -80,6 +109,13 @@ class ShoujenTokenizer:
         ]
         if missing:
             raise ValueError(f"Tokenizer is missing required special tokens: {missing}")
+        non_special = [
+            token
+            for token in PROJECT_ADDITIONAL_SPECIAL_TOKENS
+            if token not in _special_token_strings(tok)
+        ]
+        if non_special:
+            raise ValueError(f"Tokenizer did not register required special tokens: {non_special}")
 
     @property
     def vocab_size(self) -> int:
@@ -109,6 +145,14 @@ class ShoujenTokenizer:
     @property
     def im_end_id(self) -> int:
         return int(self._hf_tokenizer.convert_tokens_to_ids(IM_END_TOKEN))
+
+    @property
+    def think_start_id(self) -> int:
+        return int(self._hf_tokenizer.convert_tokens_to_ids(THINK_START_TOKEN))
+
+    @property
+    def think_end_id(self) -> int:
+        return int(self._hf_tokenizer.convert_tokens_to_ids(THINK_END_TOKEN))
 
     def encode(self, text: str, add_eos: bool = False) -> list[int]:
         ids = self._hf_tokenizer.encode(text, add_special_tokens=False)

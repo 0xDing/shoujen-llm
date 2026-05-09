@@ -135,6 +135,8 @@ def test_train_build_config_syncs_ple_vocab_to_tokenizer_size() -> None:
         eos_id=1,
         im_start_id=2,
         im_end_id=3,
+        think_start_id=4,
+        think_end_id=5,
     )
     args = types.SimpleNamespace(config=None, block_size=64)
 
@@ -142,6 +144,8 @@ def test_train_build_config_syncs_ple_vocab_to_tokenizer_size() -> None:
 
     assert cfg.vocab_size == 123
     assert cfg.vocab_size_per_layer_input == 123
+    assert cfg.think_start_token_id == 4
+    assert cfg.think_end_token_id == 5
 
 
 def test_optimizer_treats_per_layer_embedding_as_embedding_param() -> None:

@@ -9,15 +9,17 @@ SFT input format:
     A jsonl file where each line is {"messages": [{"role": ..., "content": ...}, ...]}.
     `tokenizer.encode_chat` produces input_ids and assistant_mask. Sequences are
     truncated/padded to block_size+1.
+    Offline packed SFT parquet uses tokenized `block_size + 1` windows with
+    per-target loss weights and assistant-answer spans for STP.
 
 Each batch item exposes:
     input_ids, labels, loss_mask  (all length block_size)
 where labels are shifted by 1 (predict t+1 from t), loss_mask gates the LM
 loss (1 over assistant tokens for SFT, 1 everywhere for pretraining).
 
-Semantic Tube Prediction is intentionally not emitted by these packed
-pretraining batches. A future SFT path should pass document/message-local
-span boundaries to the STP loss so it never samples across unrelated text.
+Semantic Tube Prediction is intentionally not emitted by packed pretraining
+batches. Packed SFT batches expose message-local assistant-answer spans so STP
+never samples across unrelated text or scratch-space thinking blocks.
 """
 
 from __future__ import annotations
@@ -34,6 +36,23 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from shoujen.tokenizer import ShoujenTokenizer
 
 PREPACKED_COLUMNS = ("token_ids", "seq_ids", "position_ids", "sequence_starts")
+SFT_PACKED_COLUMNS = (
+    "token_ids",
+    "seq_ids",
+    "position_ids",
+    "sequence_starts",
+    "target_loss_weights",
+    "target_role_ids",
+    "stp_span_starts",
+    "stp_span_ends",
+)
+
+SFT_ROLE_CONTROL = 0
+SFT_ROLE_SYSTEM = 1
+SFT_ROLE_USER = 2
+SFT_ROLE_THINK = 3
+SFT_ROLE_ASSISTANT = 4
+SFT_ROLE_THINK_BOUNDARY = 5
 
 
 def _iter_text_documents(path: Path) -> Iterator[str]:
@@ -183,6 +202,16 @@ def is_prepacked_parquet(path: str | Path) -> bool:
     return set(PREPACKED_COLUMNS).issubset(names)
 
 
+def is_packed_sft_parquet(path: str | Path) -> bool:
+    try:
+        import pyarrow.parquet as pq
+
+        names = set(pq.ParquetFile(str(path)).schema_arrow.names)
+    except Exception:
+        return False
+    return set(SFT_PACKED_COLUMNS).issubset(names)
+
+
 def prepacked_parquet_metadata(path: str | Path) -> dict[str, str]:
     import pyarrow.parquet as pq
 
@@ -312,6 +341,195 @@ class PrepackedParquetPretrainDataset(IterableDataset):
             if not self.repeat:
                 break
             epoch += 1
+
+
+def _make_packed_sft_sample(
+    token_ids: Sequence[int],
+    seq_ids: Sequence[int],
+    position_ids: Sequence[int],
+    sequence_starts: Sequence[bool],
+    target_loss_weights: Sequence[float],
+    target_role_ids: Sequence[int],
+    stp_span_starts: Sequence[int],
+    stp_span_ends: Sequence[int],
+    block_size: int,
+) -> dict:
+    expected_len = block_size + 1
+    if not (
+        len(token_ids)
+        == len(seq_ids)
+        == len(position_ids)
+        == len(sequence_starts)
+        == len(target_loss_weights)
+        == len(target_role_ids)
+        == expected_len
+    ):
+        raise ValueError("packed SFT samples require block_size + 1 aligned token fields")
+    if len(stp_span_starts) != len(stp_span_ends):
+        raise ValueError("stp_span_starts and stp_span_ends must have the same length")
+
+    ids_full = torch.tensor(token_ids, dtype=torch.long)
+    seq_full = torch.tensor(seq_ids, dtype=torch.long)
+    pos_full = torch.tensor(position_ids, dtype=torch.long)
+    starts_full = torch.tensor(sequence_starts, dtype=torch.bool)
+    weights_full = torch.tensor(target_loss_weights, dtype=torch.float32)
+    roles_full = torch.tensor(target_role_ids, dtype=torch.long)
+
+    input_seq_ids = seq_full[:-1]
+    label_seq_ids = seq_full[1:]
+    same_sequence_target = (input_seq_ids == label_seq_ids) & (input_seq_ids >= 0)
+
+    labels = ids_full[1:].clone()
+    labels = torch.where(same_sequence_target, labels, torch.full_like(labels, -100))
+    loss_mask = weights_full[1:] * same_sequence_target.float()
+
+    start_mask = starts_full[:-1].clone()
+    start_mask[0] = True
+
+    spans: list[tuple[int, int]] = []
+    for start, end in zip(stp_span_starts, stp_span_ends):
+        start = int(start)
+        end = int(end)
+        if end - start >= 3 and 0 <= start < end <= block_size:
+            spans.append((start, end))
+
+    return {
+        "input_ids": ids_full[:-1],
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "position_ids": pos_full[:-1],
+        "sequence_start_mask": start_mask,
+        "seq_ids": input_seq_ids,
+        "target_role_ids": roles_full[1:],
+        "stp_spans": (
+            torch.tensor(spans, dtype=torch.long)
+            if spans
+            else torch.empty((0, 2), dtype=torch.long)
+        ),
+    }
+
+
+class PrepackedParquetSFTDataset(IterableDataset):
+    """Read offline tokenized and packed SFT blocks from parquet."""
+
+    def __init__(
+        self,
+        parquet_path: str | Path,
+        block_size: int,
+        *,
+        shuffle: bool = True,
+        shuffle_buffer_size: int = 1024,
+        seed: int = 1337,
+        repeat: bool = False,
+        read_batch_size: int = 1024,
+    ):
+        self.parquet_path = Path(parquet_path)
+        self.block_size = block_size
+        self.shuffle = shuffle
+        self.shuffle_buffer_size = max(1, shuffle_buffer_size)
+        self.seed = seed
+        self.repeat = repeat
+        self.read_batch_size = read_batch_size
+        metadata = prepacked_parquet_metadata(self.parquet_path)
+        stored_block_size = metadata.get("block_size")
+        if stored_block_size is not None and int(stored_block_size) != block_size:
+            raise ValueError(
+                f"{self.parquet_path} was packed with block_size={stored_block_size}; "
+                f"training requested block_size={block_size}"
+            )
+        if not is_packed_sft_parquet(self.parquet_path):
+            raise ValueError(f"{self.parquet_path} is not a packed SFT parquet")
+
+    def _shard_info(self) -> tuple[int, int, int]:
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
+        return worker_id, num_workers, worker_id
+
+    def _iter_records(self):
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(str(self.parquet_path))
+        shard_index, shard_count, worker_id = self._shard_info()
+        record_idx = 0
+
+        for batch in pf.iter_batches(
+            batch_size=self.read_batch_size,
+            row_groups=list(range(pf.metadata.num_row_groups)),
+            columns=list(SFT_PACKED_COLUMNS),
+        ):
+            cols = {name: batch.column(name).to_pylist() for name in SFT_PACKED_COLUMNS}
+            for values in zip(*(cols[name] for name in SFT_PACKED_COLUMNS)):
+                if record_idx % shard_count == shard_index:
+                    yield (*values, worker_id)
+                record_idx += 1
+
+    def _sample_from_record(self, record: tuple) -> dict:
+        (
+            token_ids,
+            seq_ids,
+            position_ids,
+            sequence_starts,
+            target_loss_weights,
+            target_role_ids,
+            stp_span_starts,
+            stp_span_ends,
+            _worker_id,
+        ) = record
+        return _make_packed_sft_sample(
+            token_ids,
+            seq_ids,
+            position_ids,
+            sequence_starts,
+            target_loss_weights,
+            target_role_ids,
+            stp_span_starts,
+            stp_span_ends,
+            self.block_size,
+        )
+
+    def __iter__(self):
+        epoch = 0
+        while True:
+            shard_index, _shard_count, _worker_id = self._shard_info()
+            rng = random.Random(self.seed + epoch * 1009 + shard_index)
+            if self.shuffle:
+                buffer: list[tuple] = []
+                for record in self._iter_records():
+                    buffer.append(record)
+                    if len(buffer) >= self.shuffle_buffer_size:
+                        idx = rng.randrange(len(buffer))
+                        yield self._sample_from_record(buffer.pop(idx))
+                rng.shuffle(buffer)
+                for record in buffer:
+                    yield self._sample_from_record(record)
+            else:
+                for record in self._iter_records():
+                    yield self._sample_from_record(record)
+
+            if not self.repeat:
+                break
+            epoch += 1
+
+
+def packed_sft_collate(batch: list[dict]) -> dict:
+    fixed_keys = [key for key in batch[0] if key != "stp_spans"]
+    out = {key: torch.stack([item[key] for item in batch], dim=0) for key in fixed_keys}
+    out["attention_mask"] = build_packed_causal_mask(out["seq_ids"])
+
+    max_spans = max((item["stp_spans"].shape[0] for item in batch), default=0)
+    spans = torch.zeros((len(batch), max_spans, 2), dtype=torch.long)
+    span_mask = torch.zeros((len(batch), max_spans), dtype=torch.bool)
+    for row_idx, item in enumerate(batch):
+        item_spans = item["stp_spans"]
+        if item_spans.numel() == 0:
+            continue
+        count = item_spans.shape[0]
+        spans[row_idx, :count] = item_spans
+        span_mask[row_idx, :count] = True
+    out["stp_spans"] = spans
+    out["stp_span_mask"] = span_mask
+    return out
 
 
 class PackedParquetPretrainDataset(IterableDataset):

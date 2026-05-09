@@ -50,6 +50,8 @@ class ShoujenConfig(PretrainedConfig):
         eos_token_id: int = 1,
         im_start_token_id: int = 2,
         im_end_token_id: int = 3,
+        think_start_token_id: int = 4,
+        think_end_token_id: int = 5,
         tie_word_embeddings: bool = True,
         use_cache: bool = True,
         rwkv_decay_lora: int | None = None,
@@ -123,6 +125,8 @@ class ShoujenConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.im_start_token_id = im_start_token_id
         self.im_end_token_id = im_end_token_id
+        self.think_start_token_id = think_start_token_id
+        self.think_end_token_id = think_end_token_id
         self.use_cache = use_cache
 
         self.rwkv_decay_lora = rwkv_decay_lora
