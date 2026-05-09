@@ -23,8 +23,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.train import build_config
-from scripts.train_staged_packed import DEFAULT_TRAIN_FILES, resolve_data_path
+from scripts.train_staged_packed import (
+    DEFAULT_TRAIN_FILES,
+    evaluate as evaluate_staged,
+    parse_core_task_labels,
+    resolve_data_path,
+)
 from shoujen.data import PackedParquetPretrainDataset, packed_collate
+from shoujen.evaluation import evaluate_core, token_byte_lengths
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import MultipleOptimizer, build_optimizers
@@ -99,6 +105,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--eval-batches", type=int, default=50)
+    p.add_argument(
+        "--core-eval-dir",
+        type=Path,
+        default=None,
+        help="Optional CORE eval bundle directory containing core.yaml and eval_data/.",
+    )
+    p.add_argument(
+        "--core-metric-every",
+        type=int,
+        default=0,
+        help="Evaluate CORE every N optimizer steps when --core-eval-dir is set. 0 disables CORE.",
+    )
+    p.add_argument(
+        "--core-metric-max-per-task",
+        type=int,
+        default=100,
+        help="Max CORE examples per task; pass -1 for all examples.",
+    )
+    p.add_argument(
+        "--core-tasks",
+        default="",
+        help="Comma-separated CORE task labels to run; empty runs all tasks from core.yaml.",
+    )
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--grad-clip", type=float, default=1.0)
 
@@ -163,11 +192,17 @@ class ShoujenTrainer(Trainer):
         self,
         *trainer_args: Any,
         shoujen_args: argparse.Namespace,
+        shoujen_tokenizer: ShoujenTokenizer,
+        val_path: Path,
+        eval_token_bytes: torch.Tensor,
         amp_dtype: torch.dtype | None,
         **trainer_kwargs: Any,
     ):
         super().__init__(*trainer_args, **trainer_kwargs)
         self.shoujen_args = shoujen_args
+        self.shoujen_tokenizer = shoujen_tokenizer
+        self.val_path = val_path
+        self.eval_token_bytes = eval_token_bytes
         self.amp_dtype = amp_dtype
         self.model_accepts_loss_kwargs = False
 
@@ -241,6 +276,60 @@ class ShoujenTrainer(Trainer):
         self.log({"train/active_tokens": float(active_tokens.detach().float().item())})
         return (loss, outputs) if return_outputs else loss
 
+    def evaluate(self, *args: Any, **kwargs: Any) -> dict[str, float]:  # type: ignore[override]
+        metrics = super().evaluate(*args, **kwargs)
+        staged_metrics = evaluate_staged(
+            self.model,
+            self.shoujen_tokenizer,
+            self.shoujen_args,
+            val_path=self.val_path,
+            device=self.args.device,
+            amp_dtype=self.amp_dtype,
+            token_bytes=self.eval_token_bytes,
+        )
+        extra: dict[str, float] = {
+            "eval_lm_loss_staged": staged_metrics.lm_loss,
+            "eval_active_tokens": staged_metrics.active_tokens,
+            "eval_batches": float(staged_metrics.batches),
+        }
+        if math.isfinite(staged_metrics.bpb):
+            extra["eval_bpb"] = staged_metrics.bpb
+            extra["eval_bytes"] = staged_metrics.bytes
+
+        if (
+            self.shoujen_args.core_eval_dir is not None
+            and self.shoujen_args.core_metric_every > 0
+            and self.state.global_step > 0
+            and self.state.global_step % self.shoujen_args.core_metric_every == 0
+        ):
+            core = evaluate_core(
+                self.model,
+                self.shoujen_tokenizer,
+                eval_dir=self.shoujen_args.core_eval_dir,
+                device=self.args.device,
+                amp_dtype=self.amp_dtype,
+                max_per_task=self.shoujen_args.core_metric_max_per_task,
+                task_labels=parse_core_task_labels(self.shoujen_args.core_tasks),
+                seed=self.shoujen_args.seed,
+            )
+            extra["core_metric"] = core.score
+            for label, value in core.results.items():
+                key = "".join(ch if ch.isalnum() else "_" for ch in label).strip("_").lower()
+                extra[f"core_accuracy/{key}"] = value
+            for label, value in core.centered_results.items():
+                key = "".join(ch if ch.isalnum() else "_" for ch in label).strip("_").lower()
+                extra[f"core_centered/{key}"] = value
+
+        self.log(extra)
+        metrics.update(extra)
+        print(
+            f"eval_extra step={self.state.global_step} val_lm={staged_metrics.lm_loss:.4f} "
+            f"val_bpb={staged_metrics.bpb:.6f} tokens={staged_metrics.active_tokens:.0f} "
+            f"bytes={staged_metrics.bytes:.0f}",
+            flush=True,
+        )
+        return metrics
+
 
 def main() -> None:
     args = parse_args()
@@ -260,6 +349,7 @@ def main() -> None:
     amp_dtype = None if args.no_amp else autocast_dtype(device)
 
     tokenizer = ShoujenTokenizer.load(args.tokenizer)
+    eval_token_bytes = token_byte_lengths(tokenizer, device=device)
     config = build_config(args, tokenizer)
     if args.qk_norm:
         config.qk_norm = True
@@ -347,6 +437,9 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         shoujen_args=args,
+        shoujen_tokenizer=tokenizer,
+        val_path=val_path,
+        eval_token_bytes=eval_token_bytes,
         amp_dtype=amp_dtype,
     )
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)

@@ -41,8 +41,10 @@ from scripts.train_staged_packed import (
     lr_multiplier,
     make_loader,
     move_batch,
+    parse_core_task_labels,
     resolve_data_path,
 )
+from shoujen.evaluation import evaluate_core, token_byte_lengths
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
@@ -172,6 +174,29 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--eval-batches", type=int, default=20)
     p.add_argument("--eval-initial", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument(
+        "--core-eval-dir",
+        type=Path,
+        default=None,
+        help="Optional CORE eval bundle directory containing core.yaml and eval_data/.",
+    )
+    p.add_argument(
+        "--core-metric-every",
+        type=int,
+        default=0,
+        help="Evaluate CORE every N optimizer steps when --core-eval-dir is set. 0 disables CORE.",
+    )
+    p.add_argument(
+        "--core-metric-max-per-task",
+        type=int,
+        default=100,
+        help="Max CORE examples per task; pass -1 for all examples.",
+    )
+    p.add_argument(
+        "--core-tasks",
+        default="",
+        help="Comma-separated CORE task labels to run; empty runs all tasks from core.yaml.",
+    )
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--shuffle-buffer-size", type=int, default=10000)
@@ -398,6 +423,10 @@ def make_trial_train_args(
         save_every=0,
         eval_every=int(search_args.eval_every),
         eval_batches=int(search_args.eval_batches),
+        core_eval_dir=search_args.core_eval_dir,
+        core_metric_every=int(search_args.core_metric_every),
+        core_metric_max_per_task=int(search_args.core_metric_max_per_task),
+        core_tasks=search_args.core_tasks,
         log_every=int(search_args.log_every),
         grad_clip=float(params["grad_clip"]),
         muon_lr=float(params["muon_lr"]),
@@ -545,6 +574,36 @@ def maybe_report_pruning(
         raise optuna.TrialPruned()
 
 
+def maybe_evaluate_core_for_search(
+    model: ShoujenLM,
+    tokenizer: ShoujenTokenizer,
+    search_args: argparse.Namespace,
+    *,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    step: int,
+) -> dict[str, Any] | None:
+    if search_args.core_eval_dir is None or search_args.core_metric_every <= 0:
+        return None
+    if step <= 0 or (step % search_args.core_metric_every != 0 and step != search_args.trial_steps):
+        return None
+    core = evaluate_core(
+        model,
+        tokenizer,
+        eval_dir=search_args.core_eval_dir,
+        device=device,
+        amp_dtype=amp_dtype,
+        max_per_task=search_args.core_metric_max_per_task,
+        task_labels=parse_core_task_labels(search_args.core_tasks),
+        seed=search_args.seed,
+    )
+    return {
+        "core_score": core.score,
+        "core_results": core.results,
+        "core_centered_results": core.centered_results,
+    }
+
+
 def run_one_seed(
     *,
     search_args: argparse.Namespace,
@@ -561,6 +620,7 @@ def run_one_seed(
     train_args = make_trial_train_args(search_args, params, seed=seed)
     trial_amp_dtype = None if train_args.no_amp else amp_dtype
     seed_all(seed)
+    eval_token_bytes = token_byte_lengths(tokenizer, device=device)
 
     config = build_config(train_args, tokenizer)
     model = ShoujenLM(config).to(device)
@@ -596,21 +656,27 @@ def run_one_seed(
     )
 
     initial_val_loss = None
+    initial_val_bpb = None
     if search_args.eval_initial:
-        initial_val_loss, _, _ = evaluate(
+        initial_metrics = evaluate(
             model,
             tokenizer,
             train_args,
             val_path=val_path,
             device=device,
             amp_dtype=trial_amp_dtype,
+            token_bytes=eval_token_bytes,
         )
+        initial_val_loss = initial_metrics.lm_loss
+        initial_val_bpb = initial_metrics.bpb
 
     schedule_steps = max(1, train_args.lr_schedule_steps)
     max_steps_per_stage = stage_step_cap(search_args, len(train_paths))
 
     eval_records: list[dict[str, Any]] = []
     eval_losses: list[float] = []
+    eval_bpbs: list[float] = []
+    core_scores: list[float] = []
     train_losses: list[float] = []
     grad_norms: list[float] = []
     clip_count = 0
@@ -748,14 +814,16 @@ def run_one_seed(
 
                 should_eval = global_step % train_args.eval_every == 0
                 if should_eval or global_step == search_args.trial_steps:
-                    val_loss, val_tokens, val_batches = evaluate(
+                    val_metrics = evaluate(
                         model,
                         tokenizer,
                         train_args,
                         val_path=val_path,
                         device=device,
                         amp_dtype=trial_amp_dtype,
+                        token_bytes=eval_token_bytes,
                     )
+                    val_loss = val_metrics.lm_loss
                     val_loss = checked_loss(val_loss, "validation")
                     elapsed = time.time() - start_time
                     tok_per_sec = tokens_seen / max(elapsed, 1e-6)
@@ -770,19 +838,35 @@ def run_one_seed(
                         search_args=search_args,
                     )
                     eval_losses.append(val_loss)
-                    eval_records.append(
-                        {
-                            "step": global_step,
-                            "val_loss": val_loss,
-                            "val_tokens": val_tokens,
-                            "val_batches": val_batches,
-                            "tok_per_sec": tok_per_sec,
-                            "stability_penalty": current_stability,
-                        }
+                    if math.isfinite(val_metrics.bpb):
+                        eval_bpbs.append(val_metrics.bpb)
+                    eval_record = {
+                        "step": global_step,
+                        "val_loss": val_loss,
+                        "val_bpb": val_metrics.bpb,
+                        "val_bytes": val_metrics.bytes,
+                        "val_tokens": val_metrics.active_tokens,
+                        "val_batches": val_metrics.batches,
+                        "tok_per_sec": tok_per_sec,
+                        "stability_penalty": current_stability,
+                    }
+                    core_record = maybe_evaluate_core_for_search(
+                        model,
+                        tokenizer,
+                        search_args,
+                        device=device,
+                        amp_dtype=trial_amp_dtype,
+                        step=global_step,
                     )
+                    if core_record is not None:
+                        eval_record.update(core_record)
+                        if math.isfinite(float(core_record["core_score"])):
+                            core_scores.append(float(core_record["core_score"]))
+                    eval_records.append(eval_record)
                     print(
                         f"trial={trial_number} seed={seed} eval_step={global_step} "
-                        f"val_lm={val_loss:.4f} tok/s={tok_per_sec:.0f} "
+                        f"val_lm={val_loss:.4f} val_bpb={val_metrics.bpb:.6f} "
+                        f"tok/s={tok_per_sec:.0f} "
                         f"stability={current_stability:.4f}",
                         flush=True,
                     )
@@ -796,26 +880,43 @@ def run_one_seed(
                     )
 
         if not eval_losses:
-            val_loss, val_tokens, val_batches = evaluate(
+            val_metrics = evaluate(
                 model,
                 tokenizer,
                 train_args,
                 val_path=val_path,
                 device=device,
                 amp_dtype=trial_amp_dtype,
+                token_bytes=eval_token_bytes,
             )
+            val_loss = val_metrics.lm_loss
             val_loss = checked_loss(val_loss, "validation")
             eval_losses.append(val_loss)
-            eval_records.append(
-                {
-                    "step": global_step,
-                    "val_loss": val_loss,
-                    "val_tokens": val_tokens,
-                    "val_batches": val_batches,
-                    "tok_per_sec": tokens_seen / max(time.time() - start_time, 1e-6),
-                    "stability_penalty": None,
-                }
+            if math.isfinite(val_metrics.bpb):
+                eval_bpbs.append(val_metrics.bpb)
+            eval_record = {
+                "step": global_step,
+                "val_loss": val_loss,
+                "val_bpb": val_metrics.bpb,
+                "val_bytes": val_metrics.bytes,
+                "val_tokens": val_metrics.active_tokens,
+                "val_batches": val_metrics.batches,
+                "tok_per_sec": tokens_seen / max(time.time() - start_time, 1e-6),
+                "stability_penalty": None,
+            }
+            core_record = maybe_evaluate_core_for_search(
+                model,
+                tokenizer,
+                search_args,
+                device=device,
+                amp_dtype=trial_amp_dtype,
+                step=max(global_step, search_args.trial_steps),
             )
+            if core_record is not None:
+                eval_record.update(core_record)
+                if math.isfinite(float(core_record["core_score"])):
+                    core_scores.append(float(core_record["core_score"]))
+            eval_records.append(eval_record)
 
         elapsed_sec = time.time() - start_time
         tok_per_sec = tokens_seen / max(elapsed_sec, 1e-6)
@@ -844,8 +945,13 @@ def run_one_seed(
             "elapsed_sec": elapsed_sec,
             "tok_per_sec": tok_per_sec,
             "initial_val_loss": initial_val_loss,
+            "initial_val_bpb": initial_val_bpb,
             "best_val_loss": best_val_loss,
+            "best_val_bpb": min(eval_bpbs) if eval_bpbs else None,
             "final_val_loss": final_val_loss,
+            "final_val_bpb": eval_bpbs[-1] if eval_bpbs else None,
+            "best_core_score": max(core_scores) if core_scores else None,
+            "final_core_score": core_scores[-1] if core_scores else None,
             "score": score,
             "stability_penalty": final_stability,
             "clip_ratio": clip_count / max(1, global_step),
@@ -872,8 +978,13 @@ def failed_seed_result(seed: int, reason: str) -> dict[str, Any]:
         "elapsed_sec": 0.0,
         "tok_per_sec": 0.0,
         "initial_val_loss": None,
+        "initial_val_bpb": None,
         "best_val_loss": 1e9,
+        "best_val_bpb": None,
         "final_val_loss": 1e9,
+        "final_val_bpb": None,
+        "best_core_score": None,
+        "final_core_score": None,
         "score": 1e9,
         "stability_penalty": 1e9,
         "clip_ratio": None,
@@ -901,6 +1012,14 @@ def aggregate_seed_results(
 ) -> dict[str, Any]:
     best_losses = [float(r["best_val_loss"]) for r in seed_results]
     final_losses = [float(r["final_val_loss"]) for r in seed_results]
+    best_bpbs = [float(r["best_val_bpb"]) for r in seed_results if r.get("best_val_bpb") is not None]
+    final_bpbs = [float(r["final_val_bpb"]) for r in seed_results if r.get("final_val_bpb") is not None]
+    best_core_scores = [
+        float(r["best_core_score"]) for r in seed_results if r.get("best_core_score") is not None
+    ]
+    final_core_scores = [
+        float(r["final_core_score"]) for r in seed_results if r.get("final_core_score") is not None
+    ]
     speeds = [float(r["tok_per_sec"]) for r in seed_results]
     stabilities = [float(r["stability_penalty"]) for r in seed_results]
     failures = [r["failure"] for r in seed_results if r.get("failure")]
@@ -922,6 +1041,10 @@ def aggregate_seed_results(
         "best_val_loss_mean": best_val_loss_mean,
         "best_val_loss_std": seed_loss_std,
         "final_val_loss_mean": mean(final_losses),
+        "best_val_bpb_mean": mean(best_bpbs) if best_bpbs else None,
+        "final_val_bpb_mean": mean(final_bpbs) if final_bpbs else None,
+        "best_core_score_mean": mean(best_core_scores) if best_core_scores else None,
+        "final_core_score_mean": mean(final_core_scores) if final_core_scores else None,
         "tok_per_sec_mean": tok_per_sec_mean,
         "stability_penalty_mean": stability_mean,
         "failures": failures,
@@ -983,6 +1106,7 @@ def run_trial(
     print(
         f"trial={trial.number} score={aggregate['score']:.4f} "
         f"best_val={aggregate['best_val_loss_mean']:.4f} "
+        f"best_bpb={aggregate['best_val_bpb_mean'] if aggregate['best_val_bpb_mean'] is not None else float('nan'):.6f} "
         f"tok/s={aggregate['tok_per_sec_mean']:.0f} "
         f"stability={aggregate['stability_penalty_mean']:.4f}",
         flush=True,
@@ -1083,6 +1207,19 @@ def build_formal_command(args: argparse.Namespace, params: dict[str, Any]) -> st
         cmd.extend(["--config", str(args.config)])
     if args.init_ckpt:
         cmd.extend(["--init-ckpt", str(args.init_ckpt)])
+    if args.core_eval_dir:
+        cmd.extend(
+            [
+                "--core-eval-dir",
+                str(args.core_eval_dir),
+                "--core-metric-every",
+                str(args.core_metric_every),
+                "--core-metric-max-per-task",
+                str(args.core_metric_max_per_task),
+            ]
+        )
+        if args.core_tasks:
+            cmd.extend(["--core-tasks", str(args.core_tasks)])
     if args.formal_max_steps:
         cmd.extend(["--max-steps", str(args.formal_max_steps)])
     if args.formal_max_steps_per_stage:

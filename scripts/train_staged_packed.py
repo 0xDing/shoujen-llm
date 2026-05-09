@@ -35,6 +35,14 @@ from shoujen.data import (
     is_prepacked_parquet,
     packed_collate,
 )
+from shoujen.evaluation import (
+    CoreMetrics,
+    EvalMetrics,
+    bpb_from_sums,
+    compute_lm_eval_metrics,
+    evaluate_core,
+    token_byte_lengths,
+)
 from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
@@ -97,6 +105,29 @@ def parse_args():
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--eval-batches", type=int, default=50)
+    p.add_argument(
+        "--core-eval-dir",
+        type=Path,
+        default=None,
+        help="Optional CORE eval bundle directory containing core.yaml and eval_data/.",
+    )
+    p.add_argument(
+        "--core-metric-every",
+        type=int,
+        default=0,
+        help="Evaluate CORE every N optimizer steps when --core-eval-dir is set. 0 disables CORE.",
+    )
+    p.add_argument(
+        "--core-metric-max-per-task",
+        type=int,
+        default=100,
+        help="Max CORE examples per task; pass -1 for all examples.",
+    )
+    p.add_argument(
+        "--core-tasks",
+        default="",
+        help="Comma-separated CORE task labels to run; empty runs all tasks from core.yaml.",
+    )
     p.add_argument("--log-every", type=int, default=20)
     p.add_argument("--grad-clip", type=float, default=1.0)
 
@@ -316,6 +347,39 @@ def log_wandb(run, payload: dict[str, Any], step: int) -> None:
         run.log(payload, step=step)
 
 
+def parse_core_task_labels(raw: str) -> list[str] | None:
+    labels = [item.strip() for item in raw.split(",") if item.strip()]
+    return labels or None
+
+
+def maybe_evaluate_core(
+    model: ShoujenLM,
+    tokenizer: ShoujenTokenizer,
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    step: int,
+    force: bool = False,
+) -> CoreMetrics | None:
+    if args.core_eval_dir is None or args.core_metric_every <= 0:
+        return None
+    if not force and (step <= 0 or step % args.core_metric_every != 0):
+        return None
+    core = evaluate_core(
+        model,
+        tokenizer,
+        eval_dir=args.core_eval_dir,
+        device=device,
+        amp_dtype=amp_dtype,
+        max_per_task=args.core_metric_max_per_task,
+        task_labels=parse_core_task_labels(args.core_tasks),
+        seed=args.seed,
+    )
+    print(f"core step={step} score={core.score:.4f}", flush=True)
+    return core
+
+
 def make_autocast(device: torch.device, amp_dtype: torch.dtype | None):
     if amp_dtype is None:
         return torch.autocast(device_type=device.type, enabled=False)
@@ -348,9 +412,12 @@ def evaluate(
     val_path: Path,
     device: torch.device,
     amp_dtype: torch.dtype | None,
-) -> tuple[float, float, int]:
+    token_bytes: torch.Tensor | None = None,
+) -> EvalMetrics:
     was_training = model.training
     model.eval()
+    if token_bytes is None:
+        token_bytes = token_byte_lengths(tokenizer, device=device)
     loader = make_loader(
         val_path,
         tokenizer,
@@ -363,6 +430,8 @@ def evaluate(
 
     total_loss = 0.0
     total_tokens = 0.0
+    total_bpb_nats = 0.0
+    total_bytes = 0.0
     batches = 0
     for batch in loader:
         if args.eval_batches and batches >= args.eval_batches:
@@ -381,22 +450,31 @@ def evaluate(
                 sequence_start_mask=batch["sequence_start_mask"],
                 use_cache=False,
             )
-            loss, active_tokens = compute_lm_loss(
+            loss, active_tokens, bpb_nats, byte_count = compute_lm_eval_metrics(
                 outputs.logits.float(),
                 batch["labels"],
                 loss_mask=batch["loss_mask"],
+                token_bytes=token_bytes,
                 ignore_index=-100,
             )
         token_count = float(active_tokens.item())
         total_loss += float(loss.item()) * token_count
         total_tokens += token_count
+        total_bpb_nats += float(bpb_nats.item())
+        total_bytes += float(byte_count.item())
         batches += 1
 
     if was_training:
         model.train()
     if total_tokens == 0:
-        return math.nan, 0.0, batches
-    return total_loss / total_tokens, total_tokens, batches
+        return EvalMetrics(lm_loss=math.nan, active_tokens=0.0, batches=batches)
+    return EvalMetrics(
+        lm_loss=total_loss / total_tokens,
+        active_tokens=total_tokens,
+        batches=batches,
+        bpb=bpb_from_sums(total_bpb_nats, total_bytes),
+        bytes=total_bytes,
+    )
 
 
 def save_training_checkpoint(
@@ -448,6 +526,7 @@ def main():
     )
 
     tokenizer = ShoujenTokenizer.load(args.tokenizer)
+    eval_token_bytes = token_byte_lengths(tokenizer, device=device)
     config = build_config(args, tokenizer)
     if args.qk_norm:
         config.qk_norm = True
@@ -634,26 +713,35 @@ def main():
                 last_log_tokens = 0
 
             if args.eval_every and global_step % args.eval_every == 0:
-                val_loss, val_tokens, val_batches = evaluate(
+                val_metrics = evaluate(
                     model,
                     tokenizer,
                     args,
                     val_path=val_path,
                     device=device,
                     amp_dtype=amp_dtype,
+                    token_bytes=eval_token_bytes,
                 )
                 print(
-                    f"eval step={global_step} val_lm={val_loss:.4f} "
-                    f"tokens={val_tokens:.0f} batches={val_batches}",
+                    f"eval step={global_step} val_lm={val_metrics.lm_loss:.4f} "
+                    f"val_bpb={val_metrics.bpb:.6f} tokens={val_metrics.active_tokens:.0f} "
+                    f"bytes={val_metrics.bytes:.0f} batches={val_metrics.batches}",
                     flush=True,
                 )
+                payload = val_metrics.as_log_dict("val")
+                core_metrics = maybe_evaluate_core(
+                    model,
+                    tokenizer,
+                    args,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    step=global_step,
+                )
+                if core_metrics is not None:
+                    payload.update(core_metrics.as_log_dict("core"))
                 log_wandb(
                     wandb_run,
-                    {
-                        "val/lm_loss": val_loss,
-                        "val/active_tokens": val_tokens,
-                        "val/batches": val_batches,
-                    },
+                    payload,
                     global_step,
                 )
 
@@ -680,27 +768,37 @@ def main():
                 )
                 print(f"saved {out_dir / f'step{global_step}.pt'}", flush=True)
 
-        val_loss, val_tokens, val_batches = evaluate(
+        val_metrics = evaluate(
             model,
             tokenizer,
             args,
             val_path=val_path,
             device=device,
             amp_dtype=amp_dtype,
+            token_bytes=eval_token_bytes,
         )
         print(
-            f"stage_done={stage_name} step={global_step} val_lm={val_loss:.4f} "
-            f"tokens={val_tokens:.0f} batches={val_batches}",
+            f"stage_done={stage_name} step={global_step} val_lm={val_metrics.lm_loss:.4f} "
+            f"val_bpb={val_metrics.bpb:.6f} tokens={val_metrics.active_tokens:.0f} "
+            f"bytes={val_metrics.bytes:.0f} batches={val_metrics.batches}",
             flush=True,
         )
+        payload = val_metrics.as_log_dict("val")
+        payload["stage/completed_index"] = stage_idx
+        core_metrics = maybe_evaluate_core(
+            model,
+            tokenizer,
+            args,
+            device=device,
+            amp_dtype=amp_dtype,
+            step=global_step,
+            force=True,
+        )
+        if core_metrics is not None:
+            payload.update(core_metrics.as_log_dict("core"))
         log_wandb(
             wandb_run,
-            {
-                "val/lm_loss": val_loss,
-                "val/active_tokens": val_tokens,
-                "val/batches": val_batches,
-                "stage/completed_index": stage_idx,
-            },
+            payload,
             global_step,
         )
         save_training_checkpoint(

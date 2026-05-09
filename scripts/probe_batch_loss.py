@@ -38,6 +38,7 @@ from shoujen.losses import compute_lm_loss, compute_z_loss
 from shoujen.model import ShoujenLM
 from shoujen.optim import build_optimizers
 from shoujen.tokenizer import DEFAULT_TOKENIZER_ID, ShoujenTokenizer
+from shoujen.evaluation import token_byte_lengths
 from shoujen.train_utils import autocast_dtype, pick_device, set_optimizer_lr
 
 
@@ -255,18 +256,24 @@ def run_candidate(
     )
     base_muon_lrs = [group["lr"] for group in muon.param_groups]
     base_adamw_lrs = [group["lr"] for group in adamw.param_groups]
+    eval_token_bytes = token_byte_lengths(tokenizer, device=device)
 
     initial_val_loss = None
     initial_val_tokens = None
+    initial_val_bpb = None
     if args.eval_initial:
-        initial_val_loss, initial_val_tokens, _ = evaluate(
+        initial_val_metrics = evaluate(
             model,
             tokenizer,
             train_args,
             val_path=val_path,
             device=device,
             amp_dtype=amp_dtype,
+            token_bytes=eval_token_bytes,
         )
+        initial_val_loss = initial_val_metrics.lm_loss
+        initial_val_tokens = initial_val_metrics.active_tokens
+        initial_val_bpb = initial_val_metrics.bpb
 
     def make_train_loader():
         return make_loader(
@@ -370,14 +377,18 @@ def run_candidate(
         train_losses.append(sum(step_losses) / len(step_losses))
 
     elapsed = time.time() - start_time
-    final_val_loss, final_val_tokens, final_val_batches = evaluate(
+    final_val_metrics = evaluate(
         model,
         tokenizer,
         train_args,
         val_path=val_path,
         device=device,
         amp_dtype=amp_dtype,
+        token_bytes=eval_token_bytes,
     )
+    final_val_loss = final_val_metrics.lm_loss
+    final_val_tokens = final_val_metrics.active_tokens
+    final_val_batches = final_val_metrics.batches
     if device.type == "mps":
         torch.mps.synchronize()
     final_mem = device_memory(device)
@@ -401,8 +412,11 @@ def run_candidate(
         "tok_per_sec": input_tokens_seen / max(elapsed, 1e-9),
         "initial_val_loss": initial_val_loss,
         "initial_val_tokens": initial_val_tokens,
+        "initial_val_bpb": initial_val_bpb,
         "final_val_loss": final_val_loss,
         "final_val_tokens": final_val_tokens,
+        "final_val_bpb": final_val_metrics.bpb,
+        "final_val_bytes": final_val_metrics.bytes,
         "final_val_batches": final_val_batches,
         "val_loss_delta": None if initial_val_loss is None else final_val_loss - initial_val_loss,
         "train_loss_mean": train_loss_mean,

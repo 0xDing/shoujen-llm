@@ -240,6 +240,27 @@ loss signal. Use `batch_size=3 --gradient-checkpointing` when extra MPS memory
 headroom matters. Do not use gradient accumulation by default; in the short
 probe it increased the effective batch but did not improve loss.
 
+### Validation metrics
+
+Validation now reports both token-level LM loss and `val_bpb` (bits per UTF-8
+byte of non-special target tokens). `val_bpb` is logged by the staged trainer,
+the Transformers `Trainer` path, HPO trials, and batch-loss probes, so tokenizer
+or vocabulary changes can be compared more fairly than with raw cross-entropy.
+
+An optional CORE-style metric can be enabled with a nanochat/DCLM eval bundle:
+
+```bash
+uv run python scripts/train_staged_packed.py \
+  --data-dir data/processed-packed \
+  --data-format packed \
+  --core-eval-dir /path/to/eval_bundle \
+  --core-metric-every 2000 \
+  --core-metric-max-per-task 100
+```
+
+`--core-tasks task_a,task_b` restricts the run to selected task labels from
+`core.yaml`; leaving it empty evaluates every task in the bundle.
+
 ### CUDA RWKV7 kernel
 
 On CUDA, RWKV7 time-mixing now tries a runtime-compiled wind-backstepping
