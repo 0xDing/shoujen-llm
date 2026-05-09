@@ -212,6 +212,8 @@ class PrepackedParquetPretrainDataset(IterableDataset):
         seed: int = 1337,
         repeat: bool = False,
         read_batch_size: int = 1024,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.parquet_path = Path(parquet_path)
         self.block_size = block_size
@@ -220,6 +222,12 @@ class PrepackedParquetPretrainDataset(IterableDataset):
         self.seed = seed
         self.repeat = repeat
         self.read_batch_size = read_batch_size
+        if world_size < 1:
+            raise ValueError("world_size must be >= 1")
+        if rank < 0 or rank >= world_size:
+            raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+        self.rank = rank
+        self.world_size = world_size
         metadata = prepacked_parquet_metadata(self.parquet_path)
         stored_block_size = metadata.get("block_size")
         if stored_block_size is not None and int(stored_block_size) != block_size:
@@ -228,24 +236,24 @@ class PrepackedParquetPretrainDataset(IterableDataset):
                 f"training requested block_size={block_size}"
             )
 
+    def _shard_info(self) -> tuple[int, int, int]:
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
+        shard_count = self.world_size * num_workers
+        shard_index = self.rank * num_workers + worker_id
+        return shard_index, shard_count, worker_id
+
     def _iter_records(self):
         import pyarrow.parquet as pq
 
         pf = pq.ParquetFile(str(self.parquet_path))
-        row_groups = list(range(pf.metadata.num_row_groups))
-        worker = get_worker_info()
-        worker_id = 0
-        if worker is not None:
-            worker_id = worker.id
-            row_groups = [
-                row_group
-                for i, row_group in enumerate(row_groups)
-                if i % worker.num_workers == worker.id
-            ]
+        shard_index, shard_count, worker_id = self._shard_info()
+        record_idx = 0
 
         for batch in pf.iter_batches(
             batch_size=self.read_batch_size,
-            row_groups=row_groups,
+            row_groups=list(range(pf.metadata.num_row_groups)),
             columns=["token_ids", "seq_ids", "position_ids", "sequence_starts"],
         ):
             columns = [batch.column(name).to_pylist() for name in PREPACKED_COLUMNS]
@@ -256,7 +264,9 @@ class PrepackedParquetPretrainDataset(IterableDataset):
                 cols["position_ids"],
                 cols["sequence_starts"],
             ):
-                yield token_ids, seq_ids, position_ids, sequence_starts, worker_id
+                if record_idx % shard_count == shard_index:
+                    yield token_ids, seq_ids, position_ids, sequence_starts, worker_id
+                record_idx += 1
 
     def _sample_from_record(self, record: tuple) -> dict:
         token_ids, seq_ids, position_ids, sequence_starts, _worker_id = record
@@ -283,9 +293,8 @@ class PrepackedParquetPretrainDataset(IterableDataset):
     def __iter__(self):
         epoch = 0
         while True:
-            worker = get_worker_info()
-            worker_id = worker.id if worker is not None else 0
-            rng = random.Random(self.seed + epoch * 1009 + worker_id)
+            shard_index, _shard_count, _worker_id = self._shard_info()
+            rng = random.Random(self.seed + epoch * 1009 + shard_index)
             if self.shuffle:
                 buffer: list[tuple] = []
                 for record in self._iter_records():
@@ -326,6 +335,8 @@ class PackedParquetPretrainDataset(IterableDataset):
         shuffle_buffer_size: int = 10000,
         seed: int = 1337,
         repeat: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.parquet_path = Path(parquet_path)
         self.tokenizer = tokenizer
@@ -335,6 +346,20 @@ class PackedParquetPretrainDataset(IterableDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.seed = seed
         self.repeat = repeat
+        if world_size < 1:
+            raise ValueError("world_size must be >= 1")
+        if rank < 0 or rank >= world_size:
+            raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+        self.rank = rank
+        self.world_size = world_size
+
+    def _shard_info(self) -> tuple[int, int]:
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
+        shard_count = self.world_size * num_workers
+        shard_index = self.rank * num_workers + worker_id
+        return shard_index, shard_count
 
     def _stream_rows(self, epoch: int):
         from datasets import load_dataset
@@ -345,13 +370,13 @@ class PackedParquetPretrainDataset(IterableDataset):
             split="train",
             streaming=True,
         )
-        worker = get_worker_info()
-        if worker is not None:
-            stream = stream.shard(num_shards=worker.num_workers, index=worker.id)
+        shard_index, shard_count = self._shard_info()
+        if shard_count > 1:
+            stream = stream.shard(num_shards=shard_count, index=shard_index)
         if self.shuffle:
             stream = stream.shuffle(
                 buffer_size=self.shuffle_buffer_size,
-                seed=self.seed + epoch,
+                seed=self.seed + epoch + shard_index,
             )
         return stream
 

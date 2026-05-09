@@ -206,6 +206,23 @@ to the offline reader. Passing `--data-format packed` fails fast if a shard is
 missing the required packed columns or its metadata block size does not match
 the requested `--block-size`.
 
+For single-node CUDA multi-GPU training, launch the same entrypoint with
+`torchrun`. DDP is enabled automatically when `WORLD_SIZE > 1`:
+
+```bash
+uv run torchrun --standalone --nproc_per_node=4 scripts/train_staged_packed.py \
+  --data-dir data/processed-packed \
+  --data-format packed \
+  --block-size 2048 \
+  --batch-size 4
+```
+
+`--batch-size` is per GPU, so the optimizer batch is
+`batch_size * nproc_per_node * gradient_accumulation_steps`. Do not pass an
+indexed `--device cuda:N` under `torchrun`; each process binds to its
+`LOCAL_RANK` automatically. Training data is sharded by rank and dataloader
+worker, while evaluation, checkpoints, and W&B logging run only on rank 0.
+
 ### Trainer-based packed pretraining
 
 The staged parquet pretraining path also has a Transformers `Trainer` entrypoint

@@ -113,3 +113,54 @@ def test_prepacked_parquet_dataset_matches_packed_sample(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="block_size=6"):
         PrepackedParquetPretrainDataset(path, block_size=5, shuffle=False)
+
+
+def test_prepacked_parquet_dataset_shards_by_rank(tmp_path) -> None:
+    path = tmp_path / "packed.parquet"
+    block_size = 2
+    rows = 6
+    schema = pa.schema(
+        [
+            ("token_ids", pa.list_(pa.uint16(), list_size=block_size + 1)),
+            ("seq_ids", pa.list_(pa.uint16(), list_size=block_size + 1)),
+            ("position_ids", pa.list_(pa.uint32(), list_size=block_size + 1)),
+            ("sequence_starts", pa.list_(pa.bool_(), list_size=block_size + 1)),
+        ],
+        metadata={b"block_size": str(block_size).encode("ascii")},
+    )
+    table = pa.Table.from_pydict(
+        {
+            "token_ids": [[idx * 10 + 1, idx * 10 + 2, idx * 10 + 3] for idx in range(rows)],
+            "seq_ids": [[0, 0, 0] for _ in range(rows)],
+            "position_ids": [[0, 1, 2] for _ in range(rows)],
+            "sequence_starts": [[True, False, False] for _ in range(rows)],
+        },
+        schema=schema,
+    )
+    pq.write_table(table, path)
+
+    rank0 = list(
+        PrepackedParquetPretrainDataset(
+            path,
+            block_size=block_size,
+            shuffle=False,
+            rank=0,
+            world_size=2,
+        )
+    )
+    rank1 = list(
+        PrepackedParquetPretrainDataset(
+            path,
+            block_size=block_size,
+            shuffle=False,
+            rank=1,
+            world_size=2,
+        )
+    )
+
+    rank0_first_tokens = [int(sample["input_ids"][0].item()) for sample in rank0]
+    rank1_first_tokens = [int(sample["input_ids"][0].item()) for sample in rank1]
+
+    assert rank0_first_tokens == [1, 21, 41]
+    assert rank1_first_tokens == [11, 31, 51]
+    assert sorted(rank0_first_tokens + rank1_first_tokens) == [1, 11, 21, 31, 41, 51]

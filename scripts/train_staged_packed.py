@@ -17,12 +17,17 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -66,6 +71,114 @@ DEFAULT_TRAIN_FILES = [
     "s1.parquet",
     "s2.parquet",
 ]
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    enabled: bool = False
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    return int(raw) if raw is not None and raw != "" else default
+
+
+def init_distributed(args: argparse.Namespace) -> tuple[DistributedContext, torch.device]:
+    env_world_size = _env_int("WORLD_SIZE", 1)
+    enabled = env_world_size > 1 if args.distributed is None else bool(args.distributed)
+    if not enabled:
+        return DistributedContext(), torch.device(args.device) if args.device else pick_device()
+
+    if env_world_size <= 1:
+        raise SystemExit("--distributed requires launching with torchrun or another env:// launcher")
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA DDP was requested, but torch.cuda.is_available() is false")
+
+    local_rank = args.local_rank
+    if local_rank is None:
+        local_rank = _env_int("LOCAL_RANK", 0)
+    rank = _env_int("RANK", 0)
+
+    requested_device = torch.device(args.device) if args.device else None
+    if requested_device is not None and requested_device.type != "cuda":
+        raise SystemExit("Distributed training only supports CUDA devices")
+    if requested_device is not None and requested_device.index is not None:
+        if requested_device.index != local_rank:
+            raise SystemExit(
+                "In distributed mode, omit --device or pass --device cuda; "
+                "each torchrun process is bound to cuda:${LOCAL_RANK}."
+            )
+        device = requested_device
+    else:
+        device = torch.device("cuda", local_rank)
+
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", init_method="env://")
+    return DistributedContext(
+        enabled=True,
+        rank=dist.get_rank() if dist.is_initialized() else rank,
+        local_rank=local_rank,
+        world_size=dist.get_world_size() if dist.is_initialized() else env_world_size,
+    ), device
+
+
+def cleanup_distributed(ctx: DistributedContext) -> None:
+    if ctx.enabled and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def distributed_barrier(ctx: DistributedContext) -> None:
+    if ctx.enabled:
+        dist.barrier()
+
+
+def print_main(ctx: DistributedContext, *args, **kwargs) -> None:
+    if ctx.is_main:
+        print(*args, **kwargs)
+
+
+def distributed_sum_float(value: float, *, device: torch.device, ctx: DistributedContext) -> float:
+    if not ctx.enabled:
+        return value
+    tensor = torch.tensor(value, dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item())
+
+
+def distributed_max_float(value: float, *, device: torch.device, ctx: DistributedContext) -> float:
+    if not ctx.enabled:
+        return value
+    tensor = torch.tensor(value, dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def next_distributed_batch(
+    iterator: Any,
+    *,
+    device: torch.device,
+    ctx: DistributedContext,
+) -> dict[str, torch.Tensor] | None:
+    try:
+        batch = next(iterator)
+        has_batch = 1
+    except StopIteration:
+        batch = None
+        has_batch = 0
+
+    if ctx.enabled:
+        flag = torch.tensor(has_batch, dtype=torch.int32, device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        if int(flag.item()) == 0:
+            return None
+    return batch
 
 
 def parse_args():
@@ -188,6 +301,20 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--device", default=None)
+    p.add_argument(
+        "--distributed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable single-node CUDA DDP. Defaults to on when WORLD_SIZE > 1.",
+    )
+    p.add_argument(
+        "--local-rank",
+        "--local_rank",
+        dest="local_rank",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
 
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", default="shoujen-llm")
@@ -220,6 +347,8 @@ def make_loader(
     seed: int,
     device: torch.device,
     drop_last: bool,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
     data_format = resolve_data_format(path, args)
     if data_format == "packed":
@@ -230,6 +359,8 @@ def make_loader(
             shuffle_buffer_size=getattr(args, "packed_shuffle_buffer_size", 1024),
             seed=seed,
             read_batch_size=getattr(args, "packed_read_batch_size", 1024),
+            rank=rank,
+            world_size=world_size,
         )
     else:
         dataset = PackedParquetPretrainDataset(
@@ -240,6 +371,8 @@ def make_loader(
             shuffle=shuffle,
             shuffle_buffer_size=args.shuffle_buffer_size,
             seed=seed,
+            rank=rank,
+            world_size=world_size,
         )
     return DataLoader(
         dataset,
@@ -503,10 +636,15 @@ def main():
     args = parse_args()
     if args.gradient_accumulation_steps <= 0:
         raise SystemExit("--gradient-accumulation-steps must be positive")
+    dist_ctx, device = init_distributed(args)
     torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
 
     out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if dist_ctx.is_main:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    distributed_barrier(dist_ctx)
 
     train_paths = [resolve_data_path(args.data_dir, p) for p in args.train_files]
     val_path = resolve_data_path(args.data_dir, args.val_file)
@@ -514,12 +652,17 @@ def main():
     if missing:
         raise SystemExit("Missing parquet file(s): " + ", ".join(str(p) for p in missing))
 
-    device = torch.device(args.device) if args.device else pick_device()
     amp_dtype = None if args.no_amp else autocast_dtype(device)
-    print(f"device={device} amp={amp_dtype}", flush=True)
-    print("train stages: " + " -> ".join(p.name for p in train_paths), flush=True)
-    print(f"validation: {val_path.name}", flush=True)
-    print(
+    distributed_summary = (
+        f" distributed=ddp rank={dist_ctx.rank}/{dist_ctx.world_size} local_rank={dist_ctx.local_rank}"
+        if dist_ctx.enabled
+        else ""
+    )
+    print_main(dist_ctx, f"device={device} amp={amp_dtype}{distributed_summary}", flush=True)
+    print_main(dist_ctx, "train stages: " + " -> ".join(p.name for p in train_paths), flush=True)
+    print_main(dist_ctx, f"validation: {val_path.name}", flush=True)
+    print_main(
+        dist_ctx,
         "data formats: "
         + ", ".join(f"{p.name}={resolve_data_format(p, args)}" for p in [*train_paths, val_path]),
         flush=True,
@@ -530,13 +673,14 @@ def main():
     config = build_config(args, tokenizer)
     if args.qk_norm:
         config.qk_norm = True
-    config.to_json(out_dir / "config.json")
+    if dist_ctx.is_main:
+        config.to_json(out_dir / "config.json")
 
     model = ShoujenLM(config).to(device)
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
-        print("gradient_checkpointing=enabled", flush=True)
-    print(f"model: {model.num_parameters() / 1e6:.2f}M params", flush=True)
+        print_main(dist_ctx, "gradient_checkpointing=enabled", flush=True)
+    print_main(dist_ctx, f"model: {model.num_parameters() / 1e6:.2f}M params", flush=True)
 
     muon, adamw = build_optimizers(
         model,
@@ -566,13 +710,21 @@ def main():
             try:
                 adamw.load_state_dict(state["adamw"])
             except ValueError:
-                print("WARN: AdamW state shape/group mismatch - skipping.", flush=True)
+                print_main(dist_ctx, "WARN: AdamW state shape/group mismatch - skipping.", flush=True)
         global_step = int(state.get("step", 0))
-        print(f"loaded ckpt {args.init_ckpt} step={global_step}", flush=True)
+        print_main(dist_ctx, f"loaded ckpt {args.init_ckpt} step={global_step}", flush=True)
 
-    wandb_run = maybe_init_wandb(args, config, train_paths, val_path)
     model.train()
     model.set_track_max_qk_logit(args.log_max_qk_logit)
+    train_model: torch.nn.Module = model
+    if dist_ctx.enabled:
+        train_model = DDP(
+            model,
+            device_ids=[device.index],
+            output_device=device.index,
+            find_unused_parameters=False,
+        )
+    wandb_run = maybe_init_wandb(args, config, train_paths, val_path) if dist_ctx.is_main else None
     last_log_t = time.time()
     last_log_tokens = 0
     schedule_steps = max(1, args.lr_schedule_steps)
@@ -582,7 +734,7 @@ def main():
         if stop_training:
             break
         stage_name = stage_path.stem
-        print(f"stage {stage_idx + 1}/{len(train_paths)}: {stage_path}", flush=True)
+        print_main(dist_ctx, f"stage {stage_idx + 1}/{len(train_paths)}: {stage_path}", flush=True)
         loader = make_loader(
             stage_path,
             tokenizer,
@@ -591,6 +743,8 @@ def main():
             seed=args.seed + stage_idx,
             device=device,
             drop_last=True,
+            rank=dist_ctx.rank,
+            world_size=dist_ctx.world_size,
         )
 
         stage_step = 0
@@ -599,13 +753,21 @@ def main():
         last_total_loss = None
         last_z_loss = None
         last_active_tokens = None
+        last_global_active_tokens = 0.0
+        last_lm_loss_sum = 0.0
+        last_total_loss_sum = 0.0
+        last_z_loss_sum = None
         muon.zero_grad(set_to_none=True)
         adamw.zero_grad(set_to_none=True)
-        for batch in loader:
+        loader_iter = iter(loader)
+        while True:
             if args.max_steps and global_step >= args.max_steps:
                 stop_training = True
                 break
             if args.max_steps_per_stage and stage_step >= args.max_steps_per_stage:
+                break
+            batch = next_distributed_batch(loader_iter, device=device, ctx=dist_ctx)
+            if batch is None:
                 break
 
             batch = move_batch(
@@ -626,37 +788,65 @@ def main():
                 )
                 set_optimizer_momentum(muon, mom_now)
 
-            with make_autocast(device, amp_dtype):
-                outputs = model(
-                    batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    position_ids=batch["position_ids"],
-                    sequence_start_mask=batch["sequence_start_mask"],
-                    use_cache=False,
-                )
-                lm_loss, active_tokens = compute_lm_loss(
-                    outputs.logits.float(),
-                    batch["labels"],
-                    loss_mask=batch["loss_mask"],
-                    ignore_index=-100,
-                )
-                total_loss = lm_loss
-                z_loss = None
-                if args.z_loss_weight:
-                    z_loss = compute_z_loss(
-                        outputs.logits,
+            sync_grad = accum_count + 1 >= args.gradient_accumulation_steps
+            sync_context = (
+                train_model.no_sync()
+                if dist_ctx.enabled and isinstance(train_model, DDP) and not sync_grad
+                else nullcontext()
+            )
+            with sync_context:
+                with make_autocast(device, amp_dtype):
+                    outputs = train_model(
+                        batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        position_ids=batch["position_ids"],
+                        sequence_start_mask=batch["sequence_start_mask"],
+                        use_cache=False,
+                    )
+                    lm_loss, active_tokens = compute_lm_loss(
+                        outputs.logits.float(),
                         batch["labels"],
                         loss_mask=batch["loss_mask"],
                         ignore_index=-100,
                     )
-                    total_loss = total_loss + args.z_loss_weight * z_loss
+                    total_loss = lm_loss
+                    z_loss = None
+                    if args.z_loss_weight:
+                        z_loss = compute_z_loss(
+                            outputs.logits,
+                            batch["labels"],
+                            loss_mask=batch["loss_mask"],
+                            ignore_index=-100,
+                        )
+                        total_loss = total_loss + args.z_loss_weight * z_loss
 
-            (total_loss / args.gradient_accumulation_steps).backward()
+                local_active_tokens = float(active_tokens.detach().item())
+                global_active_tokens = distributed_sum_float(
+                    local_active_tokens,
+                    device=device,
+                    ctx=dist_ctx,
+                )
+                if dist_ctx.enabled:
+                    loss_scale = (
+                        dist_ctx.world_size
+                        * local_active_tokens
+                        / max(global_active_tokens, 1.0)
+                    )
+                else:
+                    loss_scale = 1.0
+                backward_loss = total_loss * loss_scale
+                (backward_loss / args.gradient_accumulation_steps).backward()
             accum_count += 1
             last_lm_loss = lm_loss
             last_total_loss = total_loss
             last_z_loss = z_loss
             last_active_tokens = active_tokens
+            last_global_active_tokens = global_active_tokens
+            last_lm_loss_sum = float(lm_loss.detach().item()) * local_active_tokens
+            last_total_loss_sum = float(total_loss.detach().item()) * local_active_tokens
+            last_z_loss_sum = (
+                float(z_loss.detach().item()) * local_active_tokens if z_loss is not None else None
+            )
             last_log_tokens += int(batch["input_ids"].numel())
 
             if accum_count < args.gradient_accumulation_steps:
@@ -677,154 +867,193 @@ def main():
 
             if args.log_every and global_step % args.log_every == 0:
                 dt = time.time() - last_log_t
-                tok_per_sec = last_log_tokens / max(dt, 1e-6)
-                extras = ""
+                total_log_tokens = distributed_sum_float(
+                    float(last_log_tokens),
+                    device=device,
+                    ctx=dist_ctx,
+                )
+                tok_per_sec = total_log_tokens / max(dt, 1e-6)
+                lm_log = distributed_sum_float(last_lm_loss_sum, device=device, ctx=dist_ctx) / max(
+                    last_global_active_tokens,
+                    1.0,
+                )
+                active_tokens_log = last_global_active_tokens if last_active_tokens is not None else 0.0
+                z_log = None
+                total_loss_log = None
                 if args.z_loss_weight and last_z_loss is not None and last_total_loss is not None:
-                    extras += f" z={last_z_loss.item():.4f} total={last_total_loss.item():.4f}"
+                    if last_z_loss_sum is not None:
+                        z_log = distributed_sum_float(
+                            last_z_loss_sum,
+                            device=device,
+                            ctx=dist_ctx,
+                        ) / max(last_global_active_tokens, 1.0)
+                    total_loss_log = distributed_sum_float(
+                        last_total_loss_sum,
+                        device=device,
+                        ctx=dist_ctx,
+                    ) / max(last_global_active_tokens, 1.0)
                 max_qk = None
                 if args.log_max_qk_logit:
-                    max_qk = model.max_qk_logit()
+                    local_max_qk = model.max_qk_logit()
+                    max_qk_value = distributed_max_float(
+                        float(local_max_qk) if local_max_qk is not None else float("-inf"),
+                        device=device,
+                        ctx=dist_ctx,
+                    )
+                    if math.isfinite(max_qk_value):
+                        max_qk = max_qk_value
+                if dist_ctx.is_main:
+                    extras = ""
+                    if z_log is not None and total_loss_log is not None:
+                        extras += f" z={z_log:.4f} total={total_loss_log:.4f}"
                     if max_qk is not None:
                         extras += f" max_qk={max_qk:.2f}"
-                print(
-                    f"stage={stage_name} step={global_step} stage_step={stage_step} "
-                    f"lm={last_lm_loss.item():.4f}{extras} lr_mult={mult:.3f} tok/s={tok_per_sec:.0f}",
-                    flush=True,
-                )
-                wandb_payload = {
-                    "train/lm_loss": float(last_lm_loss.item()),
-                    "train/active_tokens": float(last_active_tokens.item()) if last_active_tokens is not None else 0.0,
-                    "train/lr_multiplier": mult,
-                    "train/tok_per_sec": tok_per_sec,
-                    "stage/index": stage_idx,
-                    "stage/step": stage_step,
-                }
-                if last_z_loss is not None and last_total_loss is not None:
-                    wandb_payload["train/z_loss"] = float(last_z_loss.item())
-                    wandb_payload["train/total_loss"] = float(last_total_loss.item())
-                if max_qk is not None:
-                    wandb_payload["train/max_qk_logit"] = max_qk
-                log_wandb(
-                    wandb_run,
-                    wandb_payload,
-                    global_step,
-                )
+                    print(
+                        f"stage={stage_name} step={global_step} stage_step={stage_step} "
+                        f"lm={lm_log:.4f}{extras} lr_mult={mult:.3f} tok/s={tok_per_sec:.0f}",
+                        flush=True,
+                    )
+                    wandb_payload = {
+                        "train/lm_loss": lm_log,
+                        "train/active_tokens": active_tokens_log,
+                        "train/lr_multiplier": mult,
+                        "train/tok_per_sec": tok_per_sec,
+                        "stage/index": stage_idx,
+                        "stage/step": stage_step,
+                    }
+                    if z_log is not None and total_loss_log is not None:
+                        wandb_payload["train/z_loss"] = z_log
+                        wandb_payload["train/total_loss"] = total_loss_log
+                    if max_qk is not None:
+                        wandb_payload["train/max_qk_logit"] = max_qk
+                    log_wandb(
+                        wandb_run,
+                        wandb_payload,
+                        global_step,
+                    )
                 last_log_t = time.time()
                 last_log_tokens = 0
 
             if args.eval_every and global_step % args.eval_every == 0:
-                val_metrics = evaluate(
-                    model,
-                    tokenizer,
-                    args,
-                    val_path=val_path,
-                    device=device,
-                    amp_dtype=amp_dtype,
-                    token_bytes=eval_token_bytes,
-                )
-                print(
-                    f"eval step={global_step} val_lm={val_metrics.lm_loss:.4f} "
-                    f"val_bpb={val_metrics.bpb:.6f} tokens={val_metrics.active_tokens:.0f} "
-                    f"bytes={val_metrics.bytes:.0f} batches={val_metrics.batches}",
-                    flush=True,
-                )
-                payload = val_metrics.as_log_dict("val")
-                core_metrics = maybe_evaluate_core(
-                    model,
-                    tokenizer,
-                    args,
-                    device=device,
-                    amp_dtype=amp_dtype,
-                    step=global_step,
-                )
-                if core_metrics is not None:
-                    payload.update(core_metrics.as_log_dict("core"))
-                log_wandb(
-                    wandb_run,
-                    payload,
-                    global_step,
-                )
+                if dist_ctx.is_main:
+                    val_metrics = evaluate(
+                        model,
+                        tokenizer,
+                        args,
+                        val_path=val_path,
+                        device=device,
+                        amp_dtype=amp_dtype,
+                        token_bytes=eval_token_bytes,
+                    )
+                    print(
+                        f"eval step={global_step} val_lm={val_metrics.lm_loss:.4f} "
+                        f"val_bpb={val_metrics.bpb:.6f} tokens={val_metrics.active_tokens:.0f} "
+                        f"bytes={val_metrics.bytes:.0f} batches={val_metrics.batches}",
+                        flush=True,
+                    )
+                    payload = val_metrics.as_log_dict("val")
+                    core_metrics = maybe_evaluate_core(
+                        model,
+                        tokenizer,
+                        args,
+                        device=device,
+                        amp_dtype=amp_dtype,
+                        step=global_step,
+                    )
+                    if core_metrics is not None:
+                        payload.update(core_metrics.as_log_dict("core"))
+                    log_wandb(
+                        wandb_run,
+                        payload,
+                        global_step,
+                    )
+                distributed_barrier(dist_ctx)
 
             if args.save_every and global_step % args.save_every == 0:
-                save_training_checkpoint(
-                    out_dir / f"step{global_step}.pt",
-                    model=model,
-                    config=config,
-                    step=global_step,
-                    muon=muon,
-                    adamw=adamw,
-                    stage_idx=stage_idx,
-                    stage_name=stage_name,
-                )
-                save_training_checkpoint(
-                    out_dir / "last.pt",
-                    model=model,
-                    config=config,
-                    step=global_step,
-                    muon=muon,
-                    adamw=adamw,
-                    stage_idx=stage_idx,
-                    stage_name=stage_name,
-                )
-                print(f"saved {out_dir / f'step{global_step}.pt'}", flush=True)
+                if dist_ctx.is_main:
+                    save_training_checkpoint(
+                        out_dir / f"step{global_step}.pt",
+                        model=model,
+                        config=config,
+                        step=global_step,
+                        muon=muon,
+                        adamw=adamw,
+                        stage_idx=stage_idx,
+                        stage_name=stage_name,
+                    )
+                    save_training_checkpoint(
+                        out_dir / "last.pt",
+                        model=model,
+                        config=config,
+                        step=global_step,
+                        muon=muon,
+                        adamw=adamw,
+                        stage_idx=stage_idx,
+                        stage_name=stage_name,
+                    )
+                    print(f"saved {out_dir / f'step{global_step}.pt'}", flush=True)
+                distributed_barrier(dist_ctx)
 
-        val_metrics = evaluate(
-            model,
-            tokenizer,
-            args,
-            val_path=val_path,
-            device=device,
-            amp_dtype=amp_dtype,
-            token_bytes=eval_token_bytes,
-        )
-        print(
-            f"stage_done={stage_name} step={global_step} val_lm={val_metrics.lm_loss:.4f} "
-            f"val_bpb={val_metrics.bpb:.6f} tokens={val_metrics.active_tokens:.0f} "
-            f"bytes={val_metrics.bytes:.0f} batches={val_metrics.batches}",
-            flush=True,
-        )
-        payload = val_metrics.as_log_dict("val")
-        payload["stage/completed_index"] = stage_idx
-        core_metrics = maybe_evaluate_core(
-            model,
-            tokenizer,
-            args,
-            device=device,
-            amp_dtype=amp_dtype,
-            step=global_step,
-            force=True,
-        )
-        if core_metrics is not None:
-            payload.update(core_metrics.as_log_dict("core"))
-        log_wandb(
-            wandb_run,
-            payload,
-            global_step,
-        )
-        save_training_checkpoint(
-            out_dir / f"{stage_idx:02d}-{stage_name}.pt",
-            model=model,
-            config=config,
-            step=global_step,
-            muon=muon,
-            adamw=adamw,
-            stage_idx=stage_idx,
-            stage_name=stage_name,
-        )
-        save_training_checkpoint(
-            out_dir / "last.pt",
-            model=model,
-            config=config,
-            step=global_step,
-            muon=muon,
-            adamw=adamw,
-            stage_idx=stage_idx,
-            stage_name=stage_name,
-        )
+        if dist_ctx.is_main:
+            val_metrics = evaluate(
+                model,
+                tokenizer,
+                args,
+                val_path=val_path,
+                device=device,
+                amp_dtype=amp_dtype,
+                token_bytes=eval_token_bytes,
+            )
+            print(
+                f"stage_done={stage_name} step={global_step} val_lm={val_metrics.lm_loss:.4f} "
+                f"val_bpb={val_metrics.bpb:.6f} tokens={val_metrics.active_tokens:.0f} "
+                f"bytes={val_metrics.bytes:.0f} batches={val_metrics.batches}",
+                flush=True,
+            )
+            payload = val_metrics.as_log_dict("val")
+            payload["stage/completed_index"] = stage_idx
+            core_metrics = maybe_evaluate_core(
+                model,
+                tokenizer,
+                args,
+                device=device,
+                amp_dtype=amp_dtype,
+                step=global_step,
+                force=True,
+            )
+            if core_metrics is not None:
+                payload.update(core_metrics.as_log_dict("core"))
+            log_wandb(
+                wandb_run,
+                payload,
+                global_step,
+            )
+            save_training_checkpoint(
+                out_dir / f"{stage_idx:02d}-{stage_name}.pt",
+                model=model,
+                config=config,
+                step=global_step,
+                muon=muon,
+                adamw=adamw,
+                stage_idx=stage_idx,
+                stage_name=stage_name,
+            )
+            save_training_checkpoint(
+                out_dir / "last.pt",
+                model=model,
+                config=config,
+                step=global_step,
+                muon=muon,
+                adamw=adamw,
+                stage_idx=stage_idx,
+                stage_name=stage_name,
+            )
+        distributed_barrier(dist_ctx)
 
     if wandb_run is not None:
         wandb_run.finish()
-    print("done.", flush=True)
+    print_main(dist_ctx, "done.", flush=True)
+    cleanup_distributed(dist_ctx)
 
 
 if __name__ == "__main__":
