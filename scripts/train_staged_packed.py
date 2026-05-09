@@ -360,6 +360,15 @@ def parse_args():
         help="Timeout for NCCL distributed collectives.",
     )
     p.add_argument(
+        "--ddp-find-unused-parameters",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Ask DDP to detect parameters unused by a training forward pass. "
+            "Shoujen has structurally unused first-layer residual/v-first params."
+        ),
+    )
+    p.add_argument(
         "--local-rank",
         "--local_rank",
         dest="local_rank",
@@ -797,11 +806,16 @@ def main():
     model.set_track_max_qk_logit(args.log_max_qk_logit)
     train_model: torch.nn.Module = model
     if dist_ctx.enabled:
+        print_main(
+            dist_ctx,
+            f"ddp_find_unused_parameters={bool(args.ddp_find_unused_parameters)}",
+            flush=True,
+        )
         train_model = DDP(
             model,
             device_ids=[device.index],
             output_device=device.index,
-            find_unused_parameters=False,
+            find_unused_parameters=bool(args.ddp_find_unused_parameters),
         )
     wandb_run = maybe_init_wandb(args, config, train_paths, val_path) if dist_ctx.is_main else None
     last_log_t = time.time()
