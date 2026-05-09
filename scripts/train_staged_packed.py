@@ -105,6 +105,7 @@ def init_distributed(args: argparse.Namespace) -> tuple[DistributedContext, torc
     if local_rank is None:
         local_rank = _env_int("LOCAL_RANK", 0)
     rank = _env_int("RANK", 0)
+    cuda_device_count = torch.cuda.device_count()
 
     requested_device = torch.device(args.device) if args.device else None
     if requested_device is not None and requested_device.type != "cuda":
@@ -118,9 +119,19 @@ def init_distributed(args: argparse.Namespace) -> tuple[DistributedContext, torc
         device = requested_device
     else:
         device = torch.device("cuda", local_rank)
+    if device.index is None:
+        raise SystemExit("Distributed CUDA device must have an explicit index")
+    if device.index >= cuda_device_count:
+        raise SystemExit(
+            f"LOCAL_RANK={local_rank} maps to {device}, but only "
+            f"{cuda_device_count} CUDA device(s) are visible"
+        )
 
     torch.cuda.set_device(device)
-    dist.init_process_group(backend="nccl", init_method="env://")
+    try:
+        dist.init_process_group(backend="nccl", init_method="env://", device_id=device)
+    except TypeError:
+        dist.init_process_group(backend="nccl", init_method="env://")
     return DistributedContext(
         enabled=True,
         rank=dist.get_rank() if dist.is_initialized() else rank,
@@ -136,7 +147,10 @@ def cleanup_distributed(ctx: DistributedContext) -> None:
 
 def distributed_barrier(ctx: DistributedContext) -> None:
     if ctx.enabled:
-        dist.barrier()
+        try:
+            dist.barrier(device_ids=[ctx.local_rank])
+        except TypeError:
+            dist.barrier()
 
 
 def print_main(ctx: DistributedContext, *args, **kwargs) -> None:
@@ -637,6 +651,16 @@ def main():
     if args.gradient_accumulation_steps <= 0:
         raise SystemExit("--gradient-accumulation-steps must be positive")
     dist_ctx, device = init_distributed(args)
+    print_main(
+        dist_ctx,
+        (
+            f"distributed initialized backend=nccl world_size={dist_ctx.world_size} "
+            f"rank={dist_ctx.rank} local_rank={dist_ctx.local_rank} device={device}"
+            if dist_ctx.enabled
+            else "distributed disabled"
+        ),
+        flush=True,
+    )
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
@@ -645,6 +669,7 @@ def main():
     if dist_ctx.is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
     distributed_barrier(dist_ctx)
+    print_main(dist_ctx, f"output directory ready: {out_dir}", flush=True)
 
     train_paths = [resolve_data_path(args.data_dir, p) for p in args.train_files]
     val_path = resolve_data_path(args.data_dir, args.val_file)
