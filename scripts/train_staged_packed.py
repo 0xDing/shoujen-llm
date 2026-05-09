@@ -22,6 +22,7 @@ import sys
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -128,10 +129,17 @@ def init_distributed(args: argparse.Namespace) -> tuple[DistributedContext, torc
         )
 
     torch.cuda.set_device(device)
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    timeout = timedelta(seconds=args.distributed_timeout_seconds)
     try:
-        dist.init_process_group(backend="nccl", init_method="env://", device_id=device)
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            device_id=device,
+            timeout=timeout,
+        )
     except TypeError:
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout)
     return DistributedContext(
         enabled=True,
         rank=dist.get_rank() if dist.is_initialized() else rank,
@@ -156,6 +164,29 @@ def distributed_barrier(ctx: DistributedContext) -> None:
 def print_main(ctx: DistributedContext, *args, **kwargs) -> None:
     if ctx.is_main:
         print(*args, **kwargs)
+
+
+def print_rank(ctx: DistributedContext, message: str) -> None:
+    print(
+        f"[rank{ctx.rank} local_rank={ctx.local_rank} pid={os.getpid()}] {message}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def distributed_startup_check(ctx: DistributedContext, device: torch.device) -> None:
+    if not ctx.enabled:
+        return
+    print_rank(ctx, f"startup collective begin device={device}")
+    tensor = torch.tensor(ctx.rank + 1, dtype=torch.int64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    expected = ctx.world_size * (ctx.world_size + 1) // 2
+    actual = int(tensor.item())
+    if actual != expected:
+        raise RuntimeError(f"DDP startup collective returned {actual}, expected {expected}")
+    print_rank(ctx, "startup collective ok")
 
 
 def distributed_sum_float(value: float, *, device: torch.device, ctx: DistributedContext) -> float:
@@ -320,6 +351,12 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable single-node CUDA DDP. Defaults to on when WORLD_SIZE > 1.",
+    )
+    p.add_argument(
+        "--distributed-timeout-seconds",
+        type=int,
+        default=300,
+        help="Timeout for NCCL distributed collectives.",
     )
     p.add_argument(
         "--local-rank",
@@ -651,24 +688,20 @@ def main():
     if args.gradient_accumulation_steps <= 0:
         raise SystemExit("--gradient-accumulation-steps must be positive")
     dist_ctx, device = init_distributed(args)
-    print_main(
-        dist_ctx,
-        (
-            f"distributed initialized backend=nccl world_size={dist_ctx.world_size} "
-            f"rank={dist_ctx.rank} local_rank={dist_ctx.local_rank} device={device}"
-            if dist_ctx.enabled
-            else "distributed disabled"
-        ),
-        flush=True,
-    )
+    if dist_ctx.enabled:
+        print_rank(
+            dist_ctx,
+            f"distributed initialized backend=nccl world_size={dist_ctx.world_size} device={device}",
+        )
+        distributed_startup_check(dist_ctx, device)
+    else:
+        print_main(dist_ctx, "distributed disabled", flush=True)
     torch.manual_seed(args.seed)
     if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed(args.seed)
 
     out_dir = Path(args.output)
-    if dist_ctx.is_main:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    distributed_barrier(dist_ctx)
+    out_dir.mkdir(parents=True, exist_ok=True)
     print_main(dist_ctx, f"output directory ready: {out_dir}", flush=True)
 
     train_paths = [resolve_data_path(args.data_dir, p) for p in args.train_files]
