@@ -153,6 +153,16 @@ def full_batches_per_epoch(args: argparse.Namespace, row_count: int) -> int:
     )
 
 
+def maybe_use_checkpoint_config(args: argparse.Namespace) -> Path | None:
+    if args.config or not args.init_ckpt:
+        return None
+    config_path = Path(args.init_ckpt).with_name("config.json")
+    if not config_path.exists():
+        return None
+    args.config = str(config_path)
+    return config_path
+
+
 def maybe_init_wandb(args: argparse.Namespace, config: Any, rows_per_epoch: int, total_steps: int):
     if not args.wandb:
         return None
@@ -236,15 +246,37 @@ def main() -> None:
     )
 
     tokenizer = ShoujenTokenizer.load(args.tokenizer)
+    checkpoint_config_path = maybe_use_checkpoint_config(args)
+    if checkpoint_config_path is not None:
+        print(f"using checkpoint config {checkpoint_config_path}", flush=True)
     config = build_config(args, tokenizer)
     config.to_json(out / "config.json")
-    wandb_run = maybe_init_wandb(args, config, rows_per_epoch, total_steps)
 
     model = ShoujenLM(config).to(device)
     if args.init_ckpt:
-        state = load_checkpoint(args.init_ckpt, model, map_location=device)
+        try:
+            state = load_checkpoint(args.init_ckpt, model, map_location=device, allow_appended_vocab=True)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "q_norm.weight" in message or "k_norm.weight" in message:
+                raise SystemExit(
+                    "Checkpoint appears to have been trained with qk_norm enabled. "
+                    "Run with --qk-norm or provide the checkpoint's config.json via --config."
+                ) from exc
+            raise
+        appended_vocab = state.get("_shoujen_appended_vocab_keys") or []
+        if appended_vocab:
+            details = ", ".join(
+                f"{item['name']} {item['checkpoint_shape']} -> {item['model_shape']}"
+                for item in appended_vocab
+            )
+            print(
+                f"loaded ckpt with appended tokenizer rows; initialized new rows for {details}",
+                flush=True,
+            )
         print(f"loaded ckpt {args.init_ckpt} step={state.get('step', 0)}", flush=True)
     print(f"model: {model.num_parameters() / 1e6:.2f}M params", flush=True)
+    wandb_run = maybe_init_wandb(args, config, rows_per_epoch, total_steps)
 
     muon, adamw = build_optimizers(
         model,
