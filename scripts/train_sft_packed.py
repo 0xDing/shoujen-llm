@@ -15,6 +15,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
@@ -99,6 +100,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--device", default=None)
+
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb-project", default="shoujen-llm")
+    p.add_argument("--wandb-entity", default=None)
+    p.add_argument("--wandb-run-name", default=None)
+    p.add_argument("--wandb-mode", default=None)
     return p.parse_args()
 
 
@@ -144,6 +151,40 @@ def full_batches_per_epoch(args: argparse.Namespace, row_count: int) -> int:
         shard_row_count(row_count, shard_index, shard_count) // args.batch_size
         for shard_index in range(shard_count)
     )
+
+
+def maybe_init_wandb(args: argparse.Namespace, config: Any, rows_per_epoch: int, total_steps: int):
+    if not args.wandb:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise SystemExit("wandb is not installed. Install it or run without --wandb.") from exc
+
+    args_config = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    kwargs: dict[str, Any] = {
+        "project": args.wandb_project,
+        "name": args.wandb_run_name,
+        "entity": args.wandb_entity,
+        "config": {
+            **args_config,
+            "train_parquet": str(args.train_parquet),
+            "rows_per_epoch": rows_per_epoch,
+            "total_steps": total_steps,
+            "model_config": config.to_dict(),
+        },
+    }
+    if args.wandb_mode:
+        kwargs["mode"] = args.wandb_mode
+    return wandb.init(**{key: value for key, value in kwargs.items() if value is not None})
+
+
+def log_wandb(run, payload: dict[str, Any], step: int) -> None:
+    if run is not None:
+        run.log(payload, step=step)
 
 
 def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -197,6 +238,7 @@ def main() -> None:
     tokenizer = ShoujenTokenizer.load(args.tokenizer)
     config = build_config(args, tokenizer)
     config.to_json(out / "config.json")
+    wandb_run = maybe_init_wandb(args, config, rows_per_epoch, total_steps)
 
     model = ShoujenLM(config).to(device)
     if args.init_ckpt:
@@ -354,6 +396,23 @@ def main() -> None:
                     f"epoch={epoch + 1}/{args.epochs} lr_mult={mult:.3f} tok/s={tps:.0f}",
                     flush=True,
                 )
+                wandb_payload = {
+                    "train/lm_loss": last_lm_loss.item(),
+                    "train/stp_loss": last_stp_loss.item(),
+                    "train/total_loss": last_total_loss.item(),
+                    "train/active_tokens": active_tokens.item(),
+                    "train/lr_multiplier": mult,
+                    "train/tok_per_sec": tps,
+                    "epoch/index": epoch,
+                    "epoch/current": epoch + 1,
+                }
+                if args.z_loss_weight and last_z_loss is not None:
+                    wandb_payload["train/z_loss"] = last_z_loss.item()
+                if args.log_max_qk_logit:
+                    max_qk = model.max_qk_logit()
+                    if max_qk is not None:
+                        wandb_payload["train/max_qk_logit"] = max_qk
+                log_wandb(wandb_run, wandb_payload, step)
                 last_log_t = time.time()
                 last_log_tokens = 0
 
@@ -409,6 +468,8 @@ def main() -> None:
         adamw=adamw,
     )
     print(f"done epochs={args.epochs} step={step} saved {out / 'last.pt'}", flush=True)
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
