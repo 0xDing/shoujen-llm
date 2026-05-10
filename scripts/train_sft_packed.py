@@ -5,7 +5,8 @@ Typical flow:
     uv run python scripts/train_sft_packed.py \
         --train-parquet data/sft-packed/train.parquet \
         --init-ckpt runs/pretrain/last.pt \
-        --output runs/sft-packed
+        --output runs/sft-packed \
+        --epochs 3
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
     p.add_argument("--block-size", type=int, default=2048)
-    p.add_argument("--max-steps", type=int, default=5000)
+    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=20)
@@ -101,14 +102,14 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def make_loader(args: argparse.Namespace) -> DataLoader:
+def make_loader(args: argparse.Namespace, *, epoch: int) -> DataLoader:
     dataset = PrepackedParquetSFTDataset(
         args.train_parquet,
         args.block_size,
         shuffle=True,
         shuffle_buffer_size=args.shuffle_buffer_size,
-        seed=args.seed,
-        repeat=True,
+        seed=args.seed + epoch * 1009,
+        repeat=False,
         read_batch_size=args.read_batch_size,
     )
     return DataLoader(
@@ -118,6 +119,30 @@ def make_loader(args: argparse.Namespace) -> DataLoader:
         collate_fn=packed_sft_collate,
         drop_last=True,
         pin_memory=False,
+    )
+
+
+def ceil_div(n: int, d: int) -> int:
+    return (n + d - 1) // d
+
+
+def parquet_row_count(path: Path) -> int:
+    import pyarrow.parquet as pq
+
+    return int(pq.ParquetFile(str(path)).metadata.num_rows)
+
+
+def shard_row_count(row_count: int, shard_index: int, shard_count: int) -> int:
+    if shard_index >= row_count:
+        return 0
+    return ((row_count - 1 - shard_index) // shard_count) + 1
+
+
+def full_batches_per_epoch(args: argparse.Namespace, row_count: int) -> int:
+    shard_count = max(1, args.num_workers)
+    return sum(
+        shard_row_count(row_count, shard_index, shard_count) // args.batch_size
+        for shard_index in range(shard_count)
     )
 
 
@@ -139,10 +164,22 @@ def main() -> None:
     args = parse_args()
     if args.gradient_accumulation_steps <= 0:
         raise SystemExit("--gradient-accumulation-steps must be positive")
-    if args.max_steps <= 0:
-        raise SystemExit("--max-steps must be positive")
+    if args.epochs <= 0:
+        raise SystemExit("--epochs must be positive")
+    if args.batch_size <= 0:
+        raise SystemExit("--batch-size must be positive")
     if args.stp_weight and args.stp_samples_per_span <= 0:
         raise SystemExit("--stp-samples-per-span must be positive when STP is enabled")
+
+    rows_per_epoch = parquet_row_count(args.train_parquet)
+    batches_per_epoch = full_batches_per_epoch(args, rows_per_epoch)
+    if batches_per_epoch <= 0:
+        raise SystemExit(
+            f"No full training batches from {rows_per_epoch} rows; "
+            "lower --batch-size or --num-workers"
+        )
+    steps_per_epoch = ceil_div(batches_per_epoch, args.gradient_accumulation_steps)
+    total_steps = args.epochs * steps_per_epoch
 
     torch.manual_seed(args.seed)
     out = Path(args.output)
@@ -151,6 +188,11 @@ def main() -> None:
     device = torch.device(args.device) if args.device else pick_device()
     amp_dtype = None if args.no_amp else autocast_dtype(device)
     print(f"device={device} amp={amp_dtype}", flush=True)
+    print(
+        f"epochs={args.epochs} rows/epoch={rows_per_epoch} "
+        f"batches/epoch={batches_per_epoch} optimizer_steps={total_steps}",
+        flush=True,
+    )
 
     tokenizer = ShoujenTokenizer.load(args.tokenizer)
     config = build_config(args, tokenizer)
@@ -181,7 +223,6 @@ def main() -> None:
     base_adamw_lrs = [group["lr"] for group in adamw.param_groups]
     muon_mom_warmup = args.warmup if args.muon_momentum_warmup is None else args.muon_momentum_warmup
 
-    loader = make_loader(args)
     stp_loss_fn = SemanticTubePredictionLoss(
         samples_per_sequence=args.stp_samples_per_span,
         max_width=args.stp_max_width,
@@ -203,18 +244,36 @@ def main() -> None:
             return torch.autocast(device_type=device.type, enabled=False)
         return torch.autocast(device_type=device.type, dtype=amp_dtype)
 
-    while step < args.max_steps:
+    def optimizer_step() -> None:
+        nonlocal accum_count
+
+        grad_scale = args.gradient_accumulation_steps / accum_count
+        if grad_scale != 1.0:
+            for parameter in model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(grad_scale)
+
+        if args.grad_clip > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            if not torch.isfinite(grad_norm):
+                raise RuntimeError(f"Non-finite gradient norm at step {step + 1}: {grad_norm.item()}")
+        muon.step()
+        adamw.step()
+        muon.zero_grad(set_to_none=True)
+        adamw.zero_grad(set_to_none=True)
+        accum_count = 0
+
+    for epoch in range(args.epochs):
+        loader = make_loader(args, epoch=epoch)
         saw_batch = False
         for batch in loader:
             saw_batch = True
-            if step >= args.max_steps:
-                break
 
             batch = move_batch(batch, device)
             validate_batch(batch, vocab_size=tokenizer.vocab_size)
 
             if accum_count == 0:
-                mult = lr_multiplier(args, step, args.max_steps)
+                mult = lr_multiplier(args, step, total_steps)
                 set_optimizer_lr(muon, base_muon_lrs, mult)
                 set_optimizer_lr(adamw, base_adamw_lrs, mult)
                 mom_now = warmup_momentum(
@@ -273,15 +332,7 @@ def main() -> None:
             if accum_count < args.gradient_accumulation_steps:
                 continue
 
-            if args.grad_clip > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                if not torch.isfinite(grad_norm):
-                    raise RuntimeError(f"Non-finite gradient norm at step {step + 1}: {grad_norm.item()}")
-            muon.step()
-            adamw.step()
-            muon.zero_grad(set_to_none=True)
-            adamw.zero_grad(set_to_none=True)
-            accum_count = 0
+            optimizer_step()
             step += 1
 
             if step % args.log_every == 0:
@@ -300,7 +351,7 @@ def main() -> None:
                         extras += f" max_qk={max_qk:.2f}"
                 print(
                     f"step={step} lm={last_lm_loss.item():.4f}{extras} "
-                    f"lr_mult={mult:.3f} tok/s={tps:.0f}",
+                    f"epoch={epoch + 1}/{args.epochs} lr_mult={mult:.3f} tok/s={tps:.0f}",
                     flush=True,
                 )
                 last_log_t = time.time()
@@ -326,6 +377,28 @@ def main() -> None:
                 print(f"saved {out / f'step{step}.pt'}", flush=True)
         if not saw_batch:
             raise RuntimeError(f"No training batches were produced by {args.train_parquet}")
+        if accum_count:
+            optimizer_step()
+            step += 1
+            if step % args.save_every == 0:
+                save_checkpoint(
+                    out / f"step{step}.pt",
+                    model=model,
+                    config=config,
+                    step=step,
+                    muon=muon,
+                    adamw=adamw,
+                )
+                save_checkpoint(
+                    out / "last.pt",
+                    model=model,
+                    config=config,
+                    step=step,
+                    muon=muon,
+                    adamw=adamw,
+                )
+                print(f"saved {out / f'step{step}.pt'}", flush=True)
+        print(f"finished epoch={epoch + 1}/{args.epochs} step={step}", flush=True)
 
     save_checkpoint(
         out / "last.pt",
@@ -335,7 +408,7 @@ def main() -> None:
         muon=muon,
         adamw=adamw,
     )
-    print(f"done step={step} saved {out / 'last.pt'}", flush=True)
+    print(f"done epochs={args.epochs} step={step} saved {out / 'last.pt'}", flush=True)
 
 
 if __name__ == "__main__":
