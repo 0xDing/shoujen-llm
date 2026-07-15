@@ -5,7 +5,7 @@ description = "A Gradio data collection tool for OpenAI-compatible chat APIs and
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "gradio>=4.44",
+    "gradio>=6.15.1",
     "openai>=1.40",
     "python-dotenv>=1.0",
 ]
