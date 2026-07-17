@@ -5,7 +5,7 @@ description = "A toy CJK-tokenized Chinese-first chatbot LLM with RWKV7+Attentio
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.4.0",
+    "torch>=2.13.0",
     "numpy>=1.26",
     "tqdm>=4.66",
     "datasets>=2.20",
